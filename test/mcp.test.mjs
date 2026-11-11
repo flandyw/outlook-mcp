@@ -20,7 +20,7 @@ test("serves three read-only tools over authenticated Streamable HTTP", async t 
   const dir = await mkdtemp(join(tmpdir(), "outlook-mcp-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const socket_ = join(dir, "control.sock");
-  const child = spawn(process.execPath, ["dist/server.js"], {
+  const child = spawn(process.execPath, ["--import", "./test/fixtures/tailscale-interface.mjs", "dist/server.js"], {
     env: { ...process.env, MCP_TOKEN: token, MCP_PORT: String(port), MCP_ALLOWED_ORIGINS: "", OUTLOOK_DOWNLOAD_PORT: String(port + 1),
       OUTLOOK_CONTROL_SOCKET: socket_, OUTLOOK_PROFILE: join(dir, "profile"), OUTLOOK_INTERACTIVE: "0", OUTLOOK_NOTIFY: "0" },
     stdio: ["ignore", "pipe", "inherit"],
@@ -72,7 +72,7 @@ test("serves three read-only tools over authenticated Streamable HTTP", async t 
   assert.equal(status.auth, "unknown");
   assert.equal(status.browser, "stopped");
   await assert.rejects(callControl("POST", "/login", { display: {} }), { code: "NO_DISPLAY" });
-  const second = spawn(process.execPath, ["dist/server.js"], {
+  const second = spawn(process.execPath, ["--import", "./test/fixtures/tailscale-interface.mjs", "dist/server.js"], {
     env: { ...process.env, MCP_TOKEN: token, MCP_PORT: "1", OUTLOOK_CONTROL_SOCKET: socket_ },
     stdio: ["ignore", "ignore", "pipe"],
   });

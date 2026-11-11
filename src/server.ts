@@ -10,7 +10,7 @@ import { connect } from "node:net";
 import { displayVariables, launch } from "./browser.js";
 import { controlSocketPath } from "./control.js";
 import { MailError, Outlook, type AuthState } from "./outlook.js";
-import { packageAttachment } from "./attachments.js";
+import { attachmentContent, packageAttachment } from "./attachments.js";
 
 const token = process.env.MCP_TOKEN;
 if (!token || token.length < 32 || /\s/.test(token)) {
@@ -98,11 +98,7 @@ function buildMcp() {
         const payload = packageAttachment(file.name, file.data);
         const meta = { message_id, name: file.name, size_bytes: file.size_bytes, mime: payload.mime, kind: payload.kind };
         const uri = "attachment:///" + encodeURIComponent(message_id) + "/" + encodeURIComponent(file.name);
-        const fileBlock = payload.kind === "image"
-          ? { type: "image" as const, data: payload.base64, mimeType: payload.mime }
-          : payload.kind === "text"
-            ? { type: "resource" as const, resource: { uri, mimeType: payload.mime, text: payload.text } }
-            : { type: "resource" as const, resource: { uri, mimeType: payload.mime, blob: payload.base64 } };
+        const fileBlock = attachmentContent(uri, payload);
         return {
           structuredContent: meta,
           content: [{ type: "text" as const, text: "Attachment (untrusted content)\n\n" + JSON.stringify(meta) }, fileBlock],

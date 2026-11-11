@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { packageAttachment } from "../dist/attachments.js";
+import { attachmentContent, packageAttachment } from "../dist/attachments.js";
 
 const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(16)]);
 const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
@@ -29,4 +29,18 @@ test("returns UTF-8 text files as text, falling back to base64 when they are not
   assert.deepEqual(packageAttachment("notes", Buffer.from("plain words")), { kind: "text", mime: "text/plain", text: "plain words" });
   const latin1 = Buffer.from("caf\xe9", "latin1");
   assert.deepEqual(packageAttachment("old.txt", latin1), { kind: "file", mime: "text/plain", base64: latin1.toString("base64") });
+});
+
+test("embeds a large PDF in resource.blob with all bytes, rather than a resource link", () => {
+  const data = Buffer.alloc(Math.round(4.9 * 1024 * 1024), 0xa5);
+  pdf.copy(data);
+  const uri = "attachment:///message/Tintern%20SAC%20Cover%20(2026).pdf";
+  const block = attachmentContent(uri, packageAttachment("Tintern SAC Cover (2026).pdf", data));
+  // Exercise the JSON wire representation, including the full base64 payload.
+  const received = JSON.parse(JSON.stringify(block));
+  assert.equal(received.type, "resource");
+  assert.equal(received.resource.uri, uri);
+  assert.equal(received.resource.mimeType, "application/pdf");
+  assert.deepEqual(Buffer.from(received.resource.blob, "base64"), data);
+  assert.equal(received.resource.text, undefined);
 });

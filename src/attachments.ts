@@ -53,3 +53,14 @@ export function packageAttachment(name: string, data: Buffer): AttachmentPayload
   if (textMime(mime) && isUtf8Text(data)) return { kind: "text", mime, text: data.toString("utf8").replace(/^﻿/, "") };
   return { kind: "file", mime, base64: data.toString("base64") };
 }
+
+/** Embed bytes in the tool result; the URI is an identifier, never a download link. */
+export function attachmentContent(uri: string, payload: AttachmentPayload) {
+  if (payload.kind === "image") {
+    return { type: "image" as const, data: payload.base64, mimeType: payload.mime };
+  }
+  if (payload.kind === "text") {
+    return { type: "resource" as const, resource: { uri, mimeType: payload.mime, text: payload.text } };
+  }
+  return { type: "resource" as const, resource: { uri, mimeType: payload.mime, blob: payload.base64 } };
+}

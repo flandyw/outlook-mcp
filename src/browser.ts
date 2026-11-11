@@ -60,7 +60,8 @@ export async function launch(headless: boolean, display: Partial<Record<string, 
     headless,
     executablePath,
     env,
-    acceptDownloads: false,
+    // Downloads happen only when read_attachment clicks Download; files are deleted after reading.
+    acceptDownloads: true,
     serviceWorkers: "block",
   }).catch(error => {
     if (/ProcessSingleton|SingletonLock|profile.*(?:in use|locked)|user data directory is already in use|Opening in existing browser session/i.test(String(error))) {

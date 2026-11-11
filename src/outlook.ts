@@ -1,6 +1,6 @@
 import type { BrowserContext, Locator, Page } from "playwright";
 import { randomUUID } from "node:crypto";
-import { rm, readdir } from "node:fs/promises";
+import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { launch, mailbox, outlookOrigins, profileDir, ProfileLockedError, safeOrigin } from "./browser.js";
 import { isMicrosoftLogin, reauthenticate, resumeSignIn } from "./reauth.js";
 import { formatBody, type BodyPart } from "./format.js";
@@ -11,7 +11,7 @@ export class MailError extends Error {
   }
 }
 
-type Row = { index: number; sender: string; subject: string; preview: string; time: string; fingerprint: string };
+type Row = { index: number; sender: string; subject: string; preview: string; time: string; fingerprint: string; hasAttachments: boolean };
 type Reference = { query: string; row: Row; expires: number };
 
 // Keep selectors scoped and fail closed when the expected Outlook layout is missing.
@@ -26,6 +26,8 @@ const selectors = {
   // fallback never shadows the real body (Outlook also marks the subject .allowTextSelection).
   body: ['[id^="UniqueMessageBody"], [role="document"][aria-label="Message body"], [data-testid="message-body"]', '[role="document"]'],
   attachment: '[role="listbox"][aria-label*="attachment" i] [role="option"], [data-testid="attachment-name"]',
+  // The card's "More actions" menu holds Download (checked on outlook.cloud.microsoft, Nov 2026).
+  attachmentMenu: 'button[aria-haspopup="true"], button[aria-label="More actions"], [role="button"][aria-haspopup="true"]',
   recipients: { to: '[id$="_TO"][role="heading"]', cc: '[id$="_CC"][role="heading"]' },
 };
 
@@ -423,7 +425,9 @@ export class Outlook {
       const time = timeNode?.getAttribute("datetime") ?? timeNode?.textContent?.trim() ?? node.querySelector(".qq2gS[title]")?.getAttribute("title") ?? "";
       const preview = text(s.preview);
       const fingerprint = JSON.stringify([node.getAttribute("data-item-id") ?? node.getAttribute("data-convid"), sender, subject, time, preview]);
-      return [{ index, sender, subject, preview, time, fingerprint }];
+      // Outlook's row label says "Has attachments" (or similar) for messages with files.
+      const hasAttachments = /\battach/i.test(node.getAttribute("aria-label") ?? "");
+      return [{ index, sender, subject, preview, time, fingerprint, hasAttachments }];
     }), selectors);
   }
 
@@ -439,7 +443,8 @@ export class Outlook {
       const messages = hits.slice(0, limit).map(row => {
         const message_id = randomUUID();
         this.references.set(message_id, { query, row, expires: Date.now() + 30 * 60_000 });
-        return { message_id, sender: row.sender, subject: row.subject, received_at: row.time || null, snippet: row.preview.slice(0, 300) };
+        return { message_id, sender: row.sender, subject: row.subject, received_at: row.time || null,
+          has_attachments: row.hasAttachments, snippet: row.preview.slice(0, 300) };
       });
       for (const [id, reference] of this.references) {
         if (reference.expires <= Date.now() || this.references.size > 500) this.references.delete(id);
@@ -449,62 +454,152 @@ export class Outlook {
     });
   }
 
-  async read(id: string) {
+  private reference(id: string) {
     const reference = this.references.get(id);
     if (!reference || reference.expires <= Date.now()) {
       throw new MailError("UNKNOWN_MESSAGE", "Run search_mail again to get a fresh message ID.");
     }
+    return reference;
+  }
+
+  /** Finds the search row for a message ID, verifies it and opens it in the reading pane. */
+  private async openMessage(page: Page, reference: Reference) {
+    if (reference.expires <= Date.now()) {
+      throw new MailError("UNKNOWN_MESSAGE", "Run search_mail again to get a fresh message ID.");
+    }
+    const visibleRows = () => searchRegion(page).locator(selectors.results).filter({ visible: true });
+    const sameMessage = (row: Row) => {
+      if (row.fingerprint === reference.row.fingerprint) return true;
+      const [key] = JSON.parse(row.fingerprint);
+      const [expected] = JSON.parse(reference.row.fingerprint);
+      return Boolean(key && key === expected && row.sender === reference.row.sender && row.subject === reference.row.subject &&
+        row.time === reference.row.time);
+    };
+    // Exact fingerprints first. Several messages of one conversation share a key, sender and subject,
+    // so the looser key match is only a fallback for rows whose preview Outlook re-rendered.
+    const find = (rows: Row[]) => {
+      const exact = rows.filter(row => row.fingerprint === reference.row.fingerprint);
+      return exact.length ? exact : rows.filter(sameMessage);
+    };
+    let matches = this.lastSearchQuery === reference.query && await this.showingSearch(page, reference.query)
+      ? find(await this.extractRows(visibleRows()))
+      : [];
+    if (matches.length !== 1) {
+      // Run the search again for real: rows() would otherwise hand back the same cached list.
+      this.lastSearchQuery = undefined;
+      const rows = await this.rows(page, reference.query);
+      matches = find(rows);
+      if (!matches.length && reference.row.time) {
+        matches = rows.filter(row => row.sender === reference.row.sender && row.subject === reference.row.subject &&
+          row.time === reference.row.time && row.preview === reference.row.preview);
+      }
+    }
+    // Outlook lists one message twice (top results and all results) and may re-render one copy's preview.
+    // Copies with the same item key, sender, subject and time are the same message.
+    const identity = (row: Row) => JSON.stringify([JSON.parse(row.fingerprint)[0], row.sender, row.subject, row.time]);
+    if (matches.length > 1 && hasKey(matches[0]) && matches.every(match => identity(match) === identity(matches[0]))) {
+      matches = [matches[0]];
+    }
+    if (matches.length !== 1) throw new MailError("MESSAGE_CHANGED", "The result moved or became ambiguous. Search again.");
+    const row = matches[0];
+    const candidate = visibleRows().nth(row.index);
+    const snapshot = await candidate.evaluate((node, s) => {
+      const text = (selector: string) => node.querySelector(selector)?.textContent?.trim() ?? "";
+      const timeNode = node.querySelector("time");
+      return JSON.stringify([node.getAttribute("data-item-id") ?? node.getAttribute("data-convid"), text(s.sender), text(s.subject),
+        timeNode?.getAttribute("datetime") ?? timeNode?.textContent?.trim() ?? node.querySelector(".qq2gS[title]")?.getAttribute("title") ?? "", text(s.preview)]);
+    }, selectors);
+    if (snapshot !== row.fingerprint) throw new MailError("MESSAGE_CHANGED", "Search results changed before opening the message.");
+    await candidate.locator(selectors.subject).first().click();
+    return row;
+  }
+
+  private pane(page: Page, row: Row) {
+    return page.locator(selectors.pane).filter({
+      has: page.locator(selectors.heading).and(page.getByText(row.subject, { exact: true })),
+    }).first();
+  }
+
+  /** One name per attachment card, in card order, so an index always selects the same card. */
+  private attachmentNames(pane: Locator) {
+    return pane.locator(selectors.attachment).evaluateAll(nodes => nodes.map((node, index) => {
+      if (node.getAttribute("data-testid") === "attachment-name") return (node.textContent ?? "").trim() || "attachment-" + (index + 1);
+      // File cards have a titled name. Image cards show a thumbnail, so fall back to the card's label,
+      // which reads like "photo.jpg Open 2 MB".
+      const titled = node.querySelector("[title]")?.getAttribute("title")?.trim();
+      const text = ((node as HTMLElement).innerText ?? "").split("\n")[0].trim();
+      const label = (node.getAttribute("aria-label") ?? "").replace(/\s+Open(?:\s+[\d.,]+\s*[KMGT]?B)?\s*$/i, "").trim();
+      return titled || text || label || "attachment-" + (index + 1);
+    }));
+  }
+
+  async read(id: string) {
+    const reference = this.reference(id);
+    return this.run(async page => this.extract(page, await this.openMessage(page, reference), id));
+  }
+
+  /**
+   * Downloads one attachment of a message through Outlook's own Download command and returns its bytes.
+   * `attachment` is a zero-based index into attachment_names or an exact file name.
+   */
+  async downloadAttachment(id: string, attachment: number | string, maxBytes: number) {
+    const reference = this.reference(id);
     return this.run(async page => {
-      if (reference.expires <= Date.now()) {
-        throw new MailError("UNKNOWN_MESSAGE", "Run search_mail again to get a fresh message ID.");
+      const row = await this.openMessage(page, reference);
+      const pane = this.pane(page, row);
+      await pane.locator(selectors.attachment).first().waitFor({ timeout: 8000 }).catch(() => {
+        throw new MailError("NO_ATTACHMENTS", "This message has no downloadable attachments.");
+      });
+      const names = await this.attachmentNames(pane);
+      let index: number;
+      if (typeof attachment === "number") {
+        index = attachment;
+      } else {
+        let found = names.flatMap((name, position) => name === attachment ? [position] : []);
+        if (!found.length) found = names.flatMap((name, position) => name.toLowerCase() === attachment.toLowerCase() ? [position] : []);
+        if (found.length > 1) throw new MailError("AMBIGUOUS_ATTACHMENT", "Several attachments share that name. Pass its index instead.");
+        index = found[0] ?? -1;
       }
-      const visibleRows = () => searchRegion(page).locator(selectors.results).filter({ visible: true });
-      const sameMessage = (row: Row) => {
-        if (row.fingerprint === reference.row.fingerprint) return true;
-        const [key] = JSON.parse(row.fingerprint);
-        const [expected] = JSON.parse(reference.row.fingerprint);
-        return Boolean(key && key === expected && row.sender === reference.row.sender && row.subject === reference.row.subject &&
-          row.time === reference.row.time);
-      };
-      // Exact fingerprints first. Several messages of one conversation share a key, sender and subject,
-      // so the looser key match is only a fallback for rows whose preview Outlook re-rendered.
-      const find = (rows: Row[]) => {
-        const exact = rows.filter(row => row.fingerprint === reference.row.fingerprint);
-        return exact.length ? exact : rows.filter(sameMessage);
-      };
-      let matches = this.lastSearchQuery === reference.query && await this.showingSearch(page, reference.query)
-        ? find(await this.extractRows(visibleRows()))
-        : [];
-      if (matches.length !== 1) {
-        const rows = await this.rows(page, reference.query);
-        matches = find(rows);
-        if (!matches.length && reference.row.time) {
-          matches = rows.filter(row => row.sender === reference.row.sender && row.subject === reference.row.subject &&
-            row.time === reference.row.time && row.preview === reference.row.preview);
+      if (!(index >= 0 && index < names.length)) {
+        throw new MailError("UNKNOWN_ATTACHMENT", "No such attachment. Available: " + JSON.stringify(names));
+      }
+      const card = pane.locator(selectors.attachment).nth(index);
+      await card.hover().catch(() => {});
+      const menu = card.locator(selectors.attachmentMenu).first();
+      if (!await menu.count()) throw new MailError("ATTACHMENT_UNAVAILABLE", "Outlook offers no download for this attachment.");
+      await menu.click();
+      // Menu items carry icon glyphs in their text and often no aria-label, so match loosely but skip "Download all".
+      const items = page.locator('[role="menuitem"]:visible');
+      await items.first().waitFor({ timeout: 4000 }).catch(() => {});
+      const labels = await items.evaluateAll(nodes => nodes.map(node =>
+        ((node.getAttribute("aria-label") || node.textContent) ?? "").replace(/[^\p{L}\p{N} ]+/gu, " ").replace(/\s+/g, " ").trim()));
+      const position = labels.findIndex(label => /^download$/i.test(label)) >= 0
+        ? labels.findIndex(label => /^download$/i.test(label))
+        : labels.findIndex(label => /\bdownload\b/i.test(label) && !/\ball\b/i.test(label));
+      if (position < 0) {
+        console.error("outlook-mcp: attachment menu had no Download item: " + JSON.stringify(labels));
+        await page.keyboard.press("Escape").catch(() => {});
+        throw new MailError("ATTACHMENT_UNAVAILABLE", "Outlook offers no download for this attachment (it may be a cloud link).");
+      }
+      const item = items.nth(position);
+      const [download] = await Promise.all([page.waitForEvent("download", { timeout: 60_000 }), item.click()]);
+      try {
+        if (await download.failure()) throw new MailError("DOWNLOAD_FAILED", "Outlook could not download the attachment.");
+        const path = await download.path();
+        const { size } = await stat(path);
+        if (size > maxBytes) {
+          throw new MailError("ATTACHMENT_TOO_LARGE", "The attachment is " + Math.ceil(size / 1048576) + " MB, over the " +
+            Math.floor(maxBytes / 1048576) + " MB limit.");
         }
+        return { message_id: id, name: names[index] || download.suggestedFilename(), size_bytes: size, data: await readFile(path) };
+      } finally {
+        await download.delete().catch(() => {});
       }
-      if (matches.length > 1 && hasKey(matches[0]) && matches.every(match => match.fingerprint === matches[0].fingerprint)) {
-        matches = [matches[0]];
-      }
-      if (matches.length !== 1) throw new MailError("MESSAGE_CHANGED", "The result moved or became ambiguous. Search again.");
-      const row = matches[0];
-      const candidate = searchRegion(page).locator(selectors.results).filter({ visible: true }).nth(row.index);
-      const snapshot = await candidate.evaluate((node, s) => {
-        const text = (selector: string) => node.querySelector(selector)?.textContent?.trim() ?? "";
-        const timeNode = node.querySelector("time");
-        return JSON.stringify([node.getAttribute("data-item-id") ?? node.getAttribute("data-convid"), text(s.sender), text(s.subject),
-          timeNode?.getAttribute("datetime") ?? timeNode?.textContent?.trim() ?? node.querySelector(".qq2gS[title]")?.getAttribute("title") ?? "", text(s.preview)]);
-      }, selectors);
-      if (snapshot !== row.fingerprint) throw new MailError("MESSAGE_CHANGED", "Search results changed before opening the message.");
-      await candidate.locator(selectors.subject).first().click();
-      return this.extract(page, row, id);
     });
   }
 
   private async extract(page: Page, row: Row, id: string) {
-    const pane = page.locator(selectors.pane).filter({
-      has: page.locator(selectors.heading).and(page.getByText(row.subject, { exact: true })),
-    }).first();
+    const pane = this.pane(page, row);
     const findBody = async (visible: boolean) => {
       for (const selector of selectors.body) {
         const candidate = visible ? pane.locator(selector).filter({ visible: true }) : pane.locator(selector);
@@ -571,18 +666,16 @@ export class Outlook {
       });
       return parts;
     });
-    const attachments = await pane.locator(selectors.attachment).evaluateAll(nodes => nodes.map(node => {
-      if (node.getAttribute("data-testid") === "attachment-name") return node.textContent ?? "";
-      const titled = node.querySelector("[title]")?.getAttribute("title");
-      return titled || ((node as HTMLElement).innerText ?? "").split("\n")[0];
-    }));
+    // Attachment cards can render after the body. Wait for them only when the row says there are some.
+    if (row.hasAttachments) await pane.locator(selectors.attachment).first().waitFor({ timeout: 8000 }).catch(() => {});
+    const attachments = await this.attachmentNames(pane);
     const recipients = async (selector: string) => {
       const text = await pane.locator(selector).first().textContent({ timeout: 250 }).catch(() => null);
       return text?.replace(/^\s*(?:to|cc)\s*:\s*/i, "").replace(/\s+/g, " ").trim() || null;
     };
     return { message_id: id, subject: row.subject, sender: row.sender, received_at: row.time || null,
       to: await recipients(selectors.recipients.to), cc: await recipients(selectors.recipients.cc),
-      attachment_names: [...new Set(attachments.map(name => name.trim()).filter(Boolean))], ...formatBody(parts) };
+      attachment_names: attachments, ...formatBody(parts) };
   }
 
   async close() {

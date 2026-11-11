@@ -11,7 +11,7 @@ import { once } from "node:events";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-test("serves two read-only tools over authenticated Streamable HTTP", async t => {
+test("serves three read-only tools over authenticated Streamable HTTP", async t => {
   const socket = createServer().listen(0, "127.0.0.1");
   await once(socket, "listening");
   const port = socket.address().port;
@@ -40,7 +40,7 @@ test("serves two read-only tools over authenticated Streamable HTTP", async t =>
   t.after(() => client.close());
   await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers } }));
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map(tool => tool.name), ["search_mail", "read_mail"]);
+  assert.deepEqual(tools.map(tool => tool.name), ["search_mail", "read_mail", "read_attachment"]);
   assert.ok(tools.every(tool => tool.annotations.readOnlyHint));
   const response = await client.callTool({
     name: "read_mail",

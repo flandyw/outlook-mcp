@@ -1,0 +1,32 @@
+{
+  "name": "outlook-mcp",
+  "version": "1.1.0",
+  "description": "Read-only MCP server for searching and reading Outlook Web mail through a signed-in Playwright browser",
+  "scripts": {
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "start": "node --env-file=.env dist/server.js",
+    "login": "node --env-file-if-exists=.env dist/cli.js login",
+    "logout": "node --env-file-if-exists=.env dist/cli.js logout",
+    "status": "node --env-file-if-exists=.env dist/cli.js status",
+    "service:install": "sh scripts/install-service.sh",
+    "service:uninstall": "sh scripts/install-service.sh --uninstall"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "playwright": "^1.65.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.9"
+  }
+}

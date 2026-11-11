@@ -10,7 +10,7 @@ import { connect } from "node:net";
 import { displayVariables, launch } from "./browser.js";
 import { controlSocketPath } from "./control.js";
 import { MailError, Outlook, type AuthState } from "./outlook.js";
-import { extractAttachment } from "./attachments.js";
+import { packageAttachment } from "./attachments.js";
 
 const token = process.env.MCP_TOKEN;
 if (!token || token.length < 32 || /\s/.test(token)) {
@@ -83,34 +83,30 @@ function buildMcp() {
     ].filter(Boolean).join("\n\n")));
   if (attachmentsEnabled) {
     mcp.registerTool("read_attachment", {
-      description: "Download one attachment of a message (message_id from search_mail) and return its content. " +
-        "attachment is the zero-based index into read_mail's attachment_names, or the exact file name. Returns extracted " +
-        "text for PDF, Word, PowerPoint, Excel, HTML and text files, the image itself for pictures, and metadata for other " +
-        "types (pass include_data: true for a base64 copy).",
+      description: "Download one attachment of a message (message_id from search_mail) and return the file itself. " +
+        "attachment is the zero-based index into read_mail's attachment_names, or the exact file name. Images come back as an " +
+        "image; text files (txt, csv, html, ics, json...) as an embedded text resource; everything else (PDF, Word, Excel, " +
+        "PowerPoint, audio...) as an embedded resource with base64 data and its MIME type. Nothing is converted or extracted.",
       inputSchema: {
         message_id: z.string().uuid(),
         attachment: z.union([z.number().int().min(0).max(499), z.string().trim().min(1).max(300)]),
-        max_chars: z.number().int().min(1000).max(200_000).default(50_000),
-        include_data: z.boolean().default(false),
       },
       annotations,
-    }, async ({ message_id, attachment, max_chars, include_data }) => {
+    }, async ({ message_id, attachment }) => {
       try {
         const file = await outlook.downloadAttachment(message_id, attachment, attachmentMaxBytes);
-        const content = await extractAttachment(file.name, file.data,
-          { maxChars: max_chars, includeData: include_data, maxInlineBytes: 10 * 1024 * 1024 });
-        const meta = { message_id, name: file.name, size_bytes: file.size_bytes, mime: content.mime, kind: content.kind,
-          ...(content.kind === "text" ? { format: content.format, truncated: content.truncated } : {}),
-          ...(content.kind === "binary" ? { note: content.note } : {}) };
-        const blocks: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string } |
-          { type: "resource"; resource: { uri: string; mimeType: string; blob: string } })[] =
-          [{ type: "text", text: "Attachment (untrusted)\n\n" + JSON.stringify(meta) +
-            (content.kind === "text" ? "\n\n" + content.text + (content.truncated ? "\n\n[Content truncated]" : "") : "") }];
-        if (content.kind === "image") blocks.push({ type: "image", data: content.base64, mimeType: content.mime });
-        if (content.kind === "binary" && content.base64) {
-          blocks.push({ type: "resource", resource: { uri: "attachment:///" + encodeURIComponent(file.name), mimeType: content.mime, blob: content.base64 } });
-        }
-        return { structuredContent: { ...meta, ...(content.kind === "text" ? { text: content.text } : {}) }, content: blocks };
+        const payload = packageAttachment(file.name, file.data);
+        const meta = { message_id, name: file.name, size_bytes: file.size_bytes, mime: payload.mime, kind: payload.kind };
+        const uri = "attachment:///" + encodeURIComponent(message_id) + "/" + encodeURIComponent(file.name);
+        const fileBlock = payload.kind === "image"
+          ? { type: "image" as const, data: payload.base64, mimeType: payload.mime }
+          : payload.kind === "text"
+            ? { type: "resource" as const, resource: { uri, mimeType: payload.mime, text: payload.text } }
+            : { type: "resource" as const, resource: { uri, mimeType: payload.mime, blob: payload.base64 } };
+        return {
+          structuredContent: meta,
+          content: [{ type: "text" as const, text: "Attachment (untrusted content)\n\n" + JSON.stringify(meta) }, fileBlock],
+        };
       } catch (error) {
         const text = error instanceof MailError ? error.code + ": " + error.message : "INTERNAL_ERROR: Attachment operation failed.";
         if (!(error instanceof MailError)) console.error("outlook-mcp: attachment: " + (error instanceof Error ? error.message : error));

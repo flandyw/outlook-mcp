@@ -142,3 +142,50 @@ test("reads the real body, recipients and attachments from the modern layout", a
   const second = await outlook.read(hits.messages[1].message_id);
   assert.equal(second.received_at, "Tue 2026-11-10 08:00");
 });
+
+// Outlook renders only the rows near the viewport. Opening messages scrolls the list, so a row from an
+// earlier search may no longer exist in the page until the list is scrolled back to it.
+test("finds a message whose row was virtualized out of the list", async t => {
+  const browser = await launchChromium();
+  t.after(() => browser.close());
+  const context = await browser.newContext();
+  await context.route("https://outlook.office.com/**", route => route.fulfill({
+    contentType: "text/html",
+    body: `<input id="topSearchInput" aria-label="Search">
+      <div id="MailList" hidden><div id="scroller" style="height:120px;overflow-y:auto">
+        <div id="spacer" style="position:relative;height:1200px"><div role="listbox" id="rows"></div></div></div></div>
+      <div role="main" aria-label="Reading Pane"><span role="heading" id="subject"></span>
+        <div id="UniqueMessageBody_1" role="document" aria-label="Message body"></div></div>
+      <script>
+      const scroller = document.querySelector('#scroller'), list = document.querySelector('#rows');
+      const render = () => {
+        const first = Math.floor(scroller.scrollTop / 40), html = [];
+        for (let n = first; n < Math.min(30, first + 4); n++) html.push('<div role="option" data-convid="c' + n +
+          '" style="position:absolute;top:' + n * 40 + 'px;height:40px"><span data-testid="sender">Sender ' + n +
+          '</span> <span data-testid="subject">Subject ' + n + '</span></div>');
+        list.innerHTML = html.join('');
+        for (const row of list.children) row.addEventListener('click', () => {
+          const n = row.dataset.convid.slice(1);
+          document.querySelector('#subject').textContent = 'Subject ' + n;
+          document.querySelector('#UniqueMessageBody_1').textContent = 'Body ' + n;
+          scroller.scrollTop = 1000; // Outlook moves the list after opening a message.
+        });
+      };
+      scroller.addEventListener('scroll', render);
+      document.querySelector('input').addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        fetch('/searchservice/api/v2/query', { method: 'POST' }).then(() => {
+          document.querySelector('#MailList').hidden = false;
+          render();
+        });
+      });
+      </script>`,
+  }));
+  const outlook = new Outlook(async () => context);
+  const hits = await outlook.search("subject", 10);
+  assert.equal(hits.messages.length, 4);
+  assert.equal((await outlook.read(hits.messages[3].message_id)).body_markdown, "Body 3");
+  // The list is now scrolled to the bottom and rows 0-3 are gone from the page.
+  assert.equal((await outlook.read(hits.messages[1].message_id)).body_markdown, "Body 1");
+  assert.equal((await outlook.read(hits.messages[0].message_id)).body_markdown, "Body 0");
+});

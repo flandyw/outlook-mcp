@@ -482,13 +482,14 @@ export class Outlook {
       return exact.length ? exact : rows.filter(sameMessage);
     };
     let matches = this.lastSearchQuery === reference.query && await this.showingSearch(page, reference.query)
-      ? find(await this.extractRows(visibleRows()))
+      ? await this.scrollToFind(page, find)
       : [];
     if (matches.length !== 1) {
       // Run the search again for real: rows() would otherwise hand back the same cached list.
       this.lastSearchQuery = undefined;
       const rows = await this.rows(page, reference.query);
       matches = find(rows);
+      if (!matches.length) matches = await this.scrollToFind(page, find);
       if (!matches.length && reference.row.time) {
         matches = rows.filter(row => row.sender === reference.row.sender && row.subject === reference.row.subject &&
           row.time === reference.row.time && row.preview === reference.row.preview);
@@ -500,7 +501,10 @@ export class Outlook {
     if (matches.length > 1 && hasKey(matches[0]) && matches.every(match => identity(match) === identity(matches[0]))) {
       matches = [matches[0]];
     }
-    if (matches.length !== 1) throw new MailError("MESSAGE_CHANGED", "The result moved or became ambiguous. Search again.");
+    if (matches.length !== 1) {
+      console.error("outlook-mcp: message " + (matches.length ? "matched " + matches.length + " rows" : "not found") + " after a fresh search.");
+      throw new MailError("MESSAGE_CHANGED", "The result moved or became ambiguous. Search again.");
+    }
     const row = matches[0];
     const candidate = visibleRows().nth(row.index);
     const snapshot = await candidate.evaluate((node, s) => {
@@ -509,9 +513,41 @@ export class Outlook {
       return JSON.stringify([node.getAttribute("data-item-id") ?? node.getAttribute("data-convid"), text(s.sender), text(s.subject),
         timeNode?.getAttribute("datetime") ?? timeNode?.textContent?.trim() ?? node.querySelector(".qq2gS[title]")?.getAttribute("title") ?? "", text(s.preview)]);
     }, selectors);
-    if (snapshot !== row.fingerprint) throw new MailError("MESSAGE_CHANGED", "Search results changed before opening the message.");
+    if (snapshot !== row.fingerprint) {
+      console.error("outlook-mcp: search row changed between matching and opening.");
+      throw new MailError("MESSAGE_CHANGED", "Search results changed before opening the message.");
+    }
     await candidate.locator(selectors.subject).first().click();
     return row;
+  }
+
+  /**
+   * Outlook virtualizes the message list: only rows near the viewport exist in the page, and opening
+   * messages scrolls the list. Look at the rendered rows, then page through the list from the top.
+   */
+  private async scrollToFind(page: Page, find: (rows: Row[]) => Row[]) {
+    const visibleRows = () => searchRegion(page).locator(selectors.results).filter({ visible: true });
+    let matches = find(await this.extractRows(visibleRows()));
+    if (matches.length) return matches;
+    const region = searchRegion(page);
+    // Moves the list's scroll container: "top" resets it, "next" advances most of a screen. Returns false at the end.
+    const scroll = (step: "top" | "next") => region.evaluate((root, step) => {
+      const scrollable = [root, ...root.querySelectorAll("*")].find(element =>
+        element.scrollHeight > element.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(element).overflowY));
+      if (!scrollable) return false;
+      const before = scrollable.scrollTop;
+      scrollable.scrollTop = step === "top" ? 0 : before + scrollable.clientHeight * 0.8;
+      return step === "top" ? before !== 0 : scrollable.scrollTop !== before;
+    }, step).catch(() => false);
+    let moved = await scroll("top");
+    for (let steps = 0; steps < 25; steps++) {
+      if (moved) await page.waitForTimeout(250);
+      matches = find(await this.extractRows(visibleRows()));
+      if (matches.length) return matches;
+      moved = await scroll("next");
+      if (!moved) break;
+    }
+    return matches;
   }
 
   private pane(page: Page, row: Row) {

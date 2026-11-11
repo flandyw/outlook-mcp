@@ -1,6 +1,6 @@
 # Outlook Web MCP
 
-A read-only TypeScript MCP server with three tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and temporary IDs. Read returns available message metadata, Markdown and attachment names. Attachments can be downloaded and returned as extracted text or images. Search covers the results currently rendered by Outlook, including only rows the adapter can identify.
+A read-only TypeScript MCP server with three tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and temporary IDs. Read returns available message metadata, Markdown and attachment names. Attachments are returned as the original file for the model to read. Search covers the results currently rendered by Outlook, including only rows the adapter can identify.
 
 This is an unofficial browser adapter, with no Microsoft Graph API registration
 required. It is not affiliated with Microsoft. Opening messages may mark them as
@@ -21,9 +21,9 @@ side effects.
 | --- | --- | --- |
 | `search_mail` | `query` (Outlook search syntax, e.g. `from:alice`, `subject:invoice`, `hasattachments:yes`), `limit` 1–25 | `message_id`, sender, subject, `received_at`, `has_attachments`, snippet for each rendered result |
 | `read_mail` | `message_id` from `search_mail` | sender, `to`, `cc`, `received_at`, `attachment_names`, `body_markdown`, `truncated` |
-| `read_attachment` | `message_id`, `attachment` (index into `attachment_names` or exact file name), optional `max_chars` (default 50,000), `include_data` | file `name`, `size_bytes`, `mime`, `kind`, and the content: extracted `text` for PDF, Word (.docx), PowerPoint (.pptx), Excel (.xlsx), HTML, CSV and other text files; the image itself for PNG, JPEG, GIF and WebP; base64 for other types when `include_data` is true |
+| `read_attachment` | `message_id`, `attachment` (index into `attachment_names` or exact file name) | file `name`, `size_bytes`, `mime`, `kind`, plus the file itself: an image block for PNG, JPEG, GIF and WebP; an embedded text resource for UTF-8 text files (txt, csv, html, ics, json…); an embedded base64 resource for everything else (PDF, Word, Excel, PowerPoint, audio…) |
 
-Attachments are fetched with Outlook's own **Download** command, read into memory and deleted straight away. Files over 25 MB are refused (`OUTLOOK_ATTACHMENT_MAX_MB`); set `OUTLOOK_ATTACHMENTS=0` to remove the tool. PDF text needs `pdftotext` (poppler) and Office files need `unzip` on the server host. Scanned PDFs without a text layer, legacy .doc/.xls/.ppt files and cloud (OneDrive/SharePoint) links are not extracted.
+Attachments are fetched with Outlook's own **Download** command, read into memory, deleted straight away and returned unchanged; the server does not convert or extract anything, so it is up to your MCP client and model to read PDFs or Office files. Files over 25 MB are refused (`OUTLOOK_ATTACHMENT_MAX_MB`); large files make large responses, so lower the limit if your client struggles. Set `OUTLOOK_ATTACHMENTS=0` to remove the tool. Cloud (OneDrive/SharePoint) links cannot be downloaded.
 
 Outlook renders roughly the first 10–20 results, so narrow the query rather than raising `limit`. When a conversation shows several expanded messages, `read_mail` returns each body separated by `---`. Images are blocked; their alt text appears as `(image: …)`. Bodies are capped at 12,000 characters.
 
@@ -122,7 +122,7 @@ A search result ID expires after 30 minutes or on server restart. Error codes:
 
 For `TIMEOUT`, `UI_CHANGED` and `BROWSER_ERROR`, the server prints the failing Playwright step to stderr. Outlook's DOM differs between accounts and changes over time. The selectors are in `src/outlook.ts`, and the fixture in `test/mail.test.mjs` mirrors the layout they were checked against (`outlook.cloud.microsoft`, November 2026).
 
-Email fields are untrusted source data. The worker blocks images during mailbox operations and does not follow email links. It downloads an attachment only when `read_attachment` asks for it, never opens or runs it, and deletes it after extracting the content. Attachment content is untrusted in the same way as email bodies. The server does not store email bodies. Your MCP client and model provider may receive and retain returned content according to their own settings.
+Email fields are untrusted source data. The worker blocks images during mailbox operations and does not follow email links. It downloads an attachment only when `read_attachment` asks for it, never opens or runs it, and deletes it after returning it. Attachment content is untrusted in the same way as email bodies. The server does not store email bodies. Your MCP client and model provider may receive and retain returned content according to their own settings.
 
 ## Development and security
 

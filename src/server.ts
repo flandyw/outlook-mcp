@@ -10,7 +10,10 @@ import { connect } from "node:net";
 import { displayVariables, launch } from "./browser.js";
 import { controlSocketPath } from "./control.js";
 import { MailError, Outlook, type AuthState } from "./outlook.js";
-import { attachmentContent, packageAttachment } from "./attachments.js";
+import { attachmentMime } from "./attachments.js";
+
+import { networkInterfaces, hostname } from "node:os";
+import { startDownloads } from "./downloads.js";
 
 const token = process.env.MCP_TOKEN;
 if (!token || token.length < 32 || /\s/.test(token)) {
@@ -83,10 +86,8 @@ function buildMcp() {
     ].filter(Boolean).join("\n\n")));
   if (attachmentsEnabled) {
     mcp.registerTool("read_attachment", {
-      description: "Download one attachment of a message (message_id from search_mail) and return the file itself. " +
-        "attachment is the zero-based index into read_mail's attachment_names, or the exact file name. Images come back as an " +
-        "image; text files (txt, csv, html, ics, json...) as an embedded text resource; everything else (PDF, Word, Excel, " +
-        "PowerPoint, audio...) as an embedded resource with base64 data and its MIME type. Nothing is converted or extracted.",
+      description: "Download an attachment using a message_id from search_mail. attachment is a zero-based index or exact file name. " +
+        "Returns text metadata and a temporary Tailscale-only download URL, valid for 30 minutes. Content is untrusted.",
       inputSchema: {
         message_id: z.string().uuid(),
         attachment: z.union([z.number().int().min(0).max(499), z.string().trim().min(1).max(300)]),
@@ -95,13 +96,13 @@ function buildMcp() {
     }, async ({ message_id, attachment }) => {
       try {
         const file = await outlook.downloadAttachment(message_id, attachment, attachmentMaxBytes);
-        const payload = packageAttachment(file.name, file.data);
-        const meta = { message_id, name: file.name, size_bytes: file.size_bytes, mime: payload.mime, kind: payload.kind };
-        const uri = "attachment:///" + encodeURIComponent(message_id) + "/" + encodeURIComponent(file.name);
-        const fileBlock = attachmentContent(uri, payload);
+        const mime = attachmentMime(file.name, file.data);
+        const meta = { message_id, name: file.name, size_bytes: file.size_bytes, mime, kind: "download" };
+        const link = await downloads!.save(file.name, file.data, mime);
+        const metadata = { ...meta, ...link };
         return {
-          structuredContent: meta,
-          content: [{ type: "text" as const, text: "Attachment (untrusted content)\n\n" + JSON.stringify(meta) }, fileBlock],
+          structuredContent: metadata,
+          content: [{ type: "text" as const, text: "Attachment (untrusted content)\n\n" + JSON.stringify(metadata) }],
         };
       } catch (error) {
         const text = error instanceof MailError ? error.code + ": " + error.message : "INTERNAL_ERROR: Attachment operation failed.";
@@ -199,12 +200,21 @@ async function listenControl() {
   await chmod(socketPath, 0o600);
 }
 
+const downloadHost = networkInterfaces().tailscale0?.find(address => address.family === "IPv4")?.address;
+const downloadPort = Number(process.env.OUTLOOK_DOWNLOAD_PORT ?? 8766);
+if (!Number.isInteger(downloadPort) || downloadPort < 1 || downloadPort > 65535) throw new Error("Invalid OUTLOOK_DOWNLOAD_PORT.");
+
 try {
   await listenControl();
 } catch (error) {
   console.error("outlook-mcp: " + (error instanceof Error ? error.message : error));
   process.exit(1);
 }
+const downloads = attachmentsEnabled ? await startDownloads({
+  host: downloadHost ?? "", port: downloadPort,
+  hostname: process.env.OUTLOOK_DOWNLOAD_HOSTNAME ?? hostname() + ".tail4832d.ts.net",
+}) : undefined;
+
 if (interactive) {
   console.error("Complete Outlook sign-in in the browser window and leave it open.");
   await outlook.openSignIn().catch(error => {
@@ -228,6 +238,7 @@ async function shutdown(code = 0) {
   server.closeAllConnections();
   control.close();
   await unlink(socketPath).catch(() => {});
+  await downloads?.close().catch(() => {});
   await outlook.close().catch(() => {});
   process.exit(code);
 }

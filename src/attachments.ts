@@ -44,9 +44,13 @@ function isUtf8Text(data: Buffer) {
   }
 }
 
-export function packageAttachment(name: string, data: Buffer): AttachmentPayload {
+export function attachmentMime(name: string, data: Buffer): string {
   const sniffed = signatures.find(([, test]) => test(data))?.[0];
-  const mime = sniffed ?? byExtension[extname(name).toLowerCase()] ?? (isUtf8Text(data) ? "text/plain" : "application/octet-stream");
+  return sniffed ?? byExtension[extname(name).toLowerCase()] ?? (isUtf8Text(data) ? "text/plain" : "application/octet-stream");
+}
+
+export function packageAttachment(name: string, data: Buffer): AttachmentPayload {
+  const mime = attachmentMime(name, data);
   if (mime.startsWith("image/") && mime !== "image/svg+xml" && mime !== "image/heic") {
     return { kind: "image", mime, base64: data.toString("base64") };
   }

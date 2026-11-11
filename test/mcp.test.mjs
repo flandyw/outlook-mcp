@@ -1,3 +1,4 @@
+import { request } from "node:http";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -47,6 +48,22 @@ test("serves two read-only tools over authenticated Streamable HTTP", async t =>
   });
   assert.equal(response.isError, true);
   assert.match(response.content[0].text, /UNKNOWN_MESSAGE/);
+
+  // Malformed JSON and non-object payloads must not become internal errors.
+  for (const payload of ["{", "null", "[]", "42"]) {
+    const response = await new Promise((resolve, reject) => {
+      const req = request({ socketPath: socket_, method: "POST", path: "/login" }, res => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", chunk => { body += chunk; });
+        res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(body) }));
+      });
+      req.on("error", reject);
+      req.end(payload);
+    });
+    assert.equal(response.status, 400);
+    assert.equal(response.body.code, "INVALID_REQUEST");
+  }
 
   // The control socket answers status and refuses a second server.
   process.env.OUTLOOK_CONTROL_SOCKET = socket_;

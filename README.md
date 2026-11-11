@@ -2,6 +2,19 @@
 
 A read-only TypeScript MCP server with two tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and temporary IDs. Read returns available message metadata, Markdown and attachment names. Search covers the results currently rendered by Outlook, including only rows the adapter can identify.
 
+This is an unofficial browser adapter, with no Microsoft Graph API registration
+required. It is not affiliated with Microsoft. Opening messages may mark them as
+read; “read-only” describes the exposed tools, not a guarantee of zero mailbox
+side effects.
+
+## Requirements
+
+- Node.js **22.9 or newer** and npm.
+- Chromium (Playwright-managed, or a local installation via `CHROMIUM_PATH`).
+- A graphical session for interactive Microsoft sign-in and an Outlook Web account.
+- Linux is the primary target; the service installer requires systemd. Control
+  commands use Unix sockets, so native Windows is not supported. macOS is unverified.
+
 ## Tools
 
 | Tool | Input | Returns |
@@ -26,7 +39,7 @@ npm run login
 
 `npm run login` opens a sign-in window. Complete Microsoft sign-in and MFA and choose **Stay signed in** when asked: that persistent sign-in is what lets the server run headless afterwards. The window closes by itself once Outlook loads. For Outlook.com, put `OUTLOOK_URL=https://outlook.live.com/mail/` in `.env` (the default is `https://outlook.office.com/mail/`).
 
-In Outlook's mail settings, disable automatic marking as read where available, and verify with an unread test message before using the server on real mail. The profile lives in `~/.local/state/outlook-mcp/chromium` (`OUTLOOK_PROFILE`). Keep it private.
+In Outlook's mail settings, disable automatic marking as read where available, and verify with an unread test message before using the server on real mail. Use a dedicated profile: logout deletes its directory. The profile lives in `~/.local/state/outlook-mcp/chromium` (`OUTLOOK_PROFILE`). Keep it private.
 
 ## Run as a service (recommended)
 
@@ -107,3 +120,14 @@ A search result ID expires after 30 minutes or on server restart. Error codes:
 For `TIMEOUT`, `UI_CHANGED` and `BROWSER_ERROR`, the server prints the failing Playwright step to stderr. Outlook's DOM differs between accounts and changes over time. The selectors are in `src/outlook.ts`, and the fixture in `test/mail.test.mjs` mirrors the layout they were checked against (`outlook.cloud.microsoft`, November 2026).
 
 Email fields are untrusted source data. The worker blocks images during mailbox operations and does not follow email links or download attachments. The server does not store email bodies. Your MCP client and model provider may receive and retain returned content according to their own settings.
+
+## Development and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development checks and sanitized bug
+reports, [SECURITY.md](SECURITY.md) for the security model, and
+[.env.example](.env.example) for configuration settings. GitHub CI runs the fixture
+suite on Node.js 22, 24 and 26. These checks do not validate a live mailbox.
+
+## License
+
+[ISC](LICENSE).

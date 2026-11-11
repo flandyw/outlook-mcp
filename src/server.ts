@@ -118,7 +118,16 @@ const control = createServer(async (req, res) => {
       raw += chunk;
       if (raw.length > 4096) return reply(413, { code: "TOO_LARGE", message: "Request too large." });
     }
-    const body = raw ? JSON.parse(raw) as { display?: Record<string, unknown> } : {};
+    let body: { display?: Record<string, unknown> };
+    try {
+      const parsed: unknown = raw ? JSON.parse(raw) : {};
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        return reply(400, { code: "INVALID_REQUEST", message: "Expected a JSON object." });
+      }
+      body = parsed;
+    } catch {
+      return reply(400, { code: "INVALID_REQUEST", message: "Invalid JSON." });
+    }
     if (req.url === "/check") return reply(200, await outlook.check());
     if (req.url === "/logout") return reply(200, await outlook.logout());
     if (req.url === "/login") {

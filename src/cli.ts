@@ -70,7 +70,7 @@ async function status() {
 }
 
 const commands: Record<string, () => Promise<void>> = { login, logout, status };
-if (!commands[command]) fail("Usage: node dist/cli.js login | logout | status [--check]");
+if (!Object.hasOwn(commands, command)) fail("Usage: node dist/cli.js login | logout | status [--check]");
 try {
   await commands[command]();
 } catch (error) {

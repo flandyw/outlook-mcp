@@ -5,3 +5,11 @@ dist/
 !.env.example
 .diag.mjs
 *.log
+
+# Local browser profiles and test artifacts
+/playwright-report/
+/test-results/
+/coverage/
+/chromium/
+*.tsbuildinfo
+.DS_Store

@@ -10,10 +10,15 @@
     "logout": "node --env-file-if-exists=.env dist/cli.js logout",
     "status": "node --env-file-if-exists=.env dist/cli.js status",
     "service:install": "sh scripts/install-service.sh",
-    "service:uninstall": "sh scripts/install-service.sh --uninstall"
+    "service:uninstall": "sh scripts/install-service.sh --uninstall",
+    "check": "tsc --noEmit"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "outlook",
+    "mcp",
+    "playwright",
+    "email"
+  ],
   "license": "ISC",
   "type": "module",
   "dependencies": {

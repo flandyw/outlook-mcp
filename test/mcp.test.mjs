@@ -21,7 +21,7 @@ test("serves three read-only tools over authenticated Streamable HTTP", async t 
   t.after(() => rm(dir, { recursive: true, force: true }));
   const socket_ = join(dir, "control.sock");
   const child = spawn(process.execPath, ["dist/server.js"], {
-    env: { ...process.env, MCP_TOKEN: token, MCP_PORT: String(port), MCP_ALLOWED_ORIGINS: "",
+    env: { ...process.env, MCP_TOKEN: token, MCP_PORT: String(port), MCP_ALLOWED_ORIGINS: "", OUTLOOK_DOWNLOAD_PORT: String(port + 1),
       OUTLOOK_CONTROL_SOCKET: socket_, OUTLOOK_PROFILE: join(dir, "profile"), OUTLOOK_INTERACTIVE: "0", OUTLOOK_NOTIFY: "0" },
     stdio: ["ignore", "pipe", "inherit"],
   });

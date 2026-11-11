@@ -21,7 +21,7 @@ side effects.
 | --- | --- | --- |
 | `search_mail` | `query` (Outlook search syntax, e.g. `from:alice`, `subject:invoice`, `hasattachments:yes`), `limit` 1–25 | `message_id`, sender, subject, `received_at`, `has_attachments`, snippet for each rendered result |
 | `read_mail` | `message_id` from `search_mail` | sender, `to`, `cc`, `received_at`, `attachment_names`, `body_markdown`, `truncated` |
-| `read_attachment` | `message_id`, `attachment` (index into `attachment_names` or exact file name) | file `name`, `size_bytes`, `mime`, `kind`, plus the file itself: an image block for PNG, JPEG, GIF and WebP; an embedded text resource for UTF-8 text files (txt, csv, html, ics, json…); an embedded base64 resource for everything else (PDF, Word, Excel, PowerPoint, audio…) |
+| `read_attachment` | `message_id`, `attachment` (index into `attachment_names` or exact file name) | Text metadata: `name`, `size_bytes`, `mime`, `kind: download`, `download_url`, `expires_at` |
 
 Attachments are fetched with Outlook's own **Download** command, read into memory, deleted straight away and returned unchanged; the server does not convert or extract anything, so it is up to your MCP client and model to read PDFs or Office files. Files over 25 MB are refused (`OUTLOOK_ATTACHMENT_MAX_MB`); large files make large responses, so lower the limit if your client struggles. Set `OUTLOOK_ATTACHMENTS=0` to remove the tool. Cloud (OneDrive/SharePoint) links cannot be downloaded.
 
@@ -122,7 +122,7 @@ A search result ID expires after 30 minutes or on server restart. Error codes:
 
 For `TIMEOUT`, `UI_CHANGED` and `BROWSER_ERROR`, the server prints the failing Playwright step to stderr. Outlook's DOM differs between accounts and changes over time. The selectors are in `src/outlook.ts`, and the fixture in `test/mail.test.mjs` mirrors the layout they were checked against (`outlook.cloud.microsoft`, November 2026).
 
-Email fields are untrusted source data. The worker blocks images during mailbox operations and does not follow email links. It downloads an attachment only when `read_attachment` asks for it, never opens or runs it, and deletes it after returning it. Attachment content is untrusted in the same way as email bodies. The server does not store email bodies. Your MCP client and model provider may receive and retain returned content according to their own settings.
+Email fields are untrusted source data. The worker blocks images during mailbox operations and does not follow email links. It downloads an attachment only when `read_attachment` asks for it, never opens or runs it, and keeps a temporary copy for up to 30 minutes for download. Attachment content is untrusted in the same way as email bodies. The server does not store email bodies. Your MCP client and model provider may receive and retain returned content according to their own settings.
 
 ## Development and security
 
@@ -134,3 +134,23 @@ suite on Node.js 22, 24 and 26. These checks do not validate a live mailbox.
 ## License
 
 [ISC](LICENSE).
+
+
+### Temporary attachment downloads
+
+The MCP process also serves GET-only attachment links on its `tailscale0` IPv4 address,
+port 8766 (override with `OUTLOOK_DOWNLOAD_PORT`). It refuses to start the attachment
+listener on any other interface. `OUTLOOK_DOWNLOAD_HOSTNAME` overrides the URL hostname;
+the default is the machine hostname plus `.tail4832d.ts.net`.
+
+Each download has a fresh 256-bit random token. Anyone on the tailnet with the link can
+download it until its 30-minute expiry; treat links as secrets. Expired links immediately
+return 404. A cleanup pass deletes expired copies every 30 seconds. Files have mode 0600
+inside a private temporary directory. Request paths are matched against an in-memory map,
+never resolved as filesystem paths; there is no directory listing. All attachment types
+return text metadata, so MCP hosts need not handle embedded binary resources.
+
+The existing systemd service supervises both listeners in one process. Stopping or
+restarting invalidates all links and deletes temporary copies. The installed service's
+`PrivateTmp=yes` also removes its private temporary files when the service stops.
+Mail operations and their read-only annotations are unchanged.

@@ -247,3 +247,28 @@ test("returns NETWORK_ERROR when the calendar cannot be reached", async t => {
   });
   await assert.rejects(calendar.search({ start: "2026-11-12", limit: 5 }), { code: "NETWORK_ERROR" });
 });
+
+test("handles the current CalendarModule layout, restored week view and unlabelled event peek", async t => {
+  const html = `<!doctype html><button aria-label="Day" onclick="document.querySelector('main').dataset.appSection='Surface_Day'">Day</button>
+    <div data-app-section="CalendarModule">
+      <div data-app-section="CalendarSurfaceNavigationToolbar"><button aria-label="Go to next day" onclick="document.querySelector('[data-column-date]').dataset.columnDate='2026-11-13'">Next</button></div>
+      <main data-app-section="Surface_Week" aria-label="calendar view, current time: Thu 14:49">
+        <div data-column-date="2026-11-12"></div><div data-app-section="calendar-view-0">
+          <div role="button" aria-label="Lesson, 08:40 to 09:55, Thursday, November 12, 2026, S007, Busy, Categorized as Timetable" onclick="document.querySelector('#peek').hidden=false">Lesson</div>
+          <div role="button" aria-label="Day 9, all day event, Thursday, November 12, 2026, Free">Day 9</div>
+        </div>
+      </main>
+    </div>
+    <div aria-live="polite">Loaded 2 events in 1 selected calendar.</div><div id="peek" data-app-section="CalendarItemPeek" hidden><span aria-label="Title">Lesson</span><span aria-label="Time">Thu 2026-11-12 08:40 - 09:55</span><div aria-label="Location">S007</div><button onclick="throw Error('must not edit')">Edit</button><button onclick="throw Error('must not delete')">Delete</button></div>`;
+  const { calendar } = await start(t, serve(html));
+  const result = await calendar.search({ start: "2026-11-13", limit: 10 });
+  assert.equal(result.events.length, 2);
+  const lesson = result.events.find(e => e.title === "Lesson");
+  assert.equal(lesson.date, "2026-11-13");
+  assert.equal(lesson.location, "S007");
+  assert.equal(lesson.start, "2026-11-13 08:40");
+  const details = await calendar.read(lesson.event_id);
+  assert.equal(details.title, "Lesson");
+  assert.equal(details.when, "Thu 2026-11-12 08:40 - 09:55");
+  assert.equal(details.location, "S007");
+});

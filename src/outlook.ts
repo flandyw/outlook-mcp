@@ -136,6 +136,8 @@ export class Outlook {
   private idleTimer?: NodeJS.Timeout;
   private context?: BrowserContext;
   private page?: Page;
+  /** Tabs owned by another read-only surface, such as calendar. Mail must not type into them. */
+  private reserved = new Set<Page>();
   private queue = Promise.resolve();
   private references = new Map<string, Reference>();
 
@@ -171,10 +173,13 @@ export class Outlook {
         if (this.context !== context) return;
         this.context = undefined;
         this.page = undefined;
+        this.reserved.clear();
       });
     }
     if (!this.page || this.page.isClosed()) {
-      const page = this.context.pages().find(candidate => !candidate.isClosed()) ?? await this.context.newPage();
+      // Skip tabs another surface reserved. An empty set keeps the original "first open page" behavior.
+      const page = this.context.pages().find(candidate => !candidate.isClosed() && !this.reserved.has(candidate))
+        ?? await this.context.newPage();
       page.once("crash", () => {
         console.error("outlook-mcp: the Outlook tab crashed. The next request opens a new one.");
         void page.close().catch(() => {});
@@ -192,6 +197,7 @@ export class Outlook {
     const context = this.context;
     this.context = undefined;
     this.page = undefined;
+    this.reserved.clear();
     this.lastSearchQuery = undefined;
     await context?.close().catch(() => {});
   }
@@ -366,6 +372,28 @@ export class Outlook {
   private async signInPrompt(page: Page) {
     return page.getByRole("link", { name: /^sign in$/i }).or(page.getByRole("button", { name: /^sign in$/i }))
       .or(page.getByText(/session (?:has )?expired|signed out|sign in again/i)).first().isVisible().catch(() => false);
+  }
+
+  /**
+   * Marks a tab as belonging to another read-only surface so the next mail operation
+   * does not reuse it. Calendar holds its own tab; the mailbox tab stays on mail.
+   */
+  holdPage(page: Page) {
+    if (this.reserved.has(page)) return;
+    this.reserved.add(page);
+    page.once("close", () => this.reserved.delete(page));
+  }
+
+  /**
+   * Runs read-only work in the signed-in browser after the mailbox session is ready.
+   * Serialized with mail on the same queue, with the same auth recovery and error codes.
+   */
+  useBrowser<T>(work: (context: BrowserContext) => Promise<T>) {
+    return this.run(async page => {
+      await this.ensureMailbox(page);
+      if (!this.context) throw new MailError("BROWSER_ERROR", "The browser is not open.");
+      return work(this.context);
+    });
   }
 
   /** Navigates to Outlook when needed, recovers sign-in and returns the search box. */

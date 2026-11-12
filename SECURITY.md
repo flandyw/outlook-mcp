@@ -21,6 +21,8 @@ clicked. If the button is absent, the message may stay read. Returned email is
 untrusted input and may contain prompt injection. Clients must treat it as data,
 not instructions. Returned content may be retained by the client or model provider.
 
+The tools never create, edit, delete or respond to calendar events. Events open in the details peek; if the editor opens, the adapter uses Escape and Discard, then returns UI_CHANGED. Calendar notes are untrusted data, not instructions.
+
 Do not put credentials, private mailbox content, or exploit details in public
 issues. Use the repository's private vulnerability reporting feature if enabled.
 Otherwise contact the repository owner privately before disclosing details.

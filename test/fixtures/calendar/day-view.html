@@ -1,0 +1,195 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Calendar</title>
+<!--
+  Sanitized Outlook day view targeted by src/calendar.ts (November 2026). Fictional school events.
+  Rendered shape:
+  <main data-testid="calendar-surface" aria-label="Calendar">
+    <h1 data-testid="calendar-date" data-date="2026-11-12">Thursday, 12 November 2026</h1>
+    <button type="button">Previous day</button>
+    <button type="button">Next day</button>
+    <input type="date" aria-label="Calendar date">
+    <div role="grid">
+      <div role="button" data-testid="calendar-event" data-event-id="evt-maths"
+           aria-label="Specialist Maths, 9:00 AM to 10:15 AM, Room 4">
+        <span data-testid="event-title">Specialist Maths</span>
+        <time data-testid="event-start" datetime="2026-11-12T09:00:00+11:00">9:00 AM</time>
+        <time data-testid="event-end" datetime="2026-11-12T10:15:00+11:00">10:15 AM</time>
+        <span data-testid="event-location">Room 4</span>
+      </div>
+    </div>
+    <div role="dialog" data-testid="event-peek">attendees, notes, recurrence, response buttons</div>
+  </main>
+  __MODE__ is "url" (honour the path), "sticky" (ignore the path and use the day buttons),
+  or "input" (ignore the path and use the date input). __DROP__ omits events.
+-->
+<main data-testid="calendar-surface" aria-label="Calendar">
+  <h1 data-testid="calendar-date"></h1>
+  <button type="button" id="prev">Previous day</button>
+  <button type="button" id="next">Next day</button>
+  <input id="date" type="date" aria-label="Calendar date" hidden>
+  <div role="grid" id="grid" style="min-height:40px"></div>
+  <div role="dialog" data-testid="event-peek" aria-label="Event details" hidden>
+    <h2 data-testid="event-heading"></h2>
+    <div data-testid="event-when"></div>
+    <div data-testid="event-where"></div>
+    <div data-testid="event-recurrence" hidden></div>
+    <ul data-testid="event-attendees" aria-label="Attendees"></ul>
+    <div data-testid="event-notes"></div>
+    <button type="button" data-action="accept">Accept</button>
+    <button type="button" data-action="tentative">Tentative</button>
+    <button type="button" data-action="decline">Decline</button>
+    <button type="button" data-action="edit">Edit</button>
+    <button type="button" data-action="delete">Delete</button>
+  </div>
+</main>
+<script>
+const mode = "__MODE__";
+const drop = __DROP__;
+const headings = {
+  "2026-11-12": "Thursday, 12 November 2026",
+  "2026-11-13": "Friday, 13 November 2026",
+  "2026-11-14": "Saturday, 14 November 2026",
+};
+const notes = {
+  maths: '<p>Bring the <a href="https://example.com/sheet" data-action="link">formula sheet</a>.</p>'
+    + "<ul><li>Calculator</li></ul>"
+    + "<table><tr><td>Bring</td><td>Calculator</td></tr></table>"
+    + "<p># Not a heading</p>"
+    + '<p><img alt="Seating plan" src="seat.png"></p>'
+    + "<p hidden>Hidden note</p>",
+};
+const catalog = {
+  "evt-maths": {
+    title: "Specialist Maths",
+    when: "Thursday, 12 November 2026 9:00 AM – 10:15 AM",
+    where: "Room 4",
+    recurrence: "Occurs every Thursday until 20 November 2026",
+    attendees: [["Alex Chen", "Accepted"], ["Sam Lee", "Tentative"], ["Jordan Lee", "Organizer"]],
+    notes: notes.maths,
+  },
+  "evt-chem": {
+    title: "Chemistry prac",
+    when: "Thursday, 12 November 2026 1:00 PM – 2:30 PM",
+    where: "Lab 2",
+    recurrence: "",
+    attendees: [],
+    notes: "<p>Safety glasses.</p>",
+  },
+  "evt-assembly": {
+    title: "Assembly",
+    when: "Friday, 13 November 2026, all day",
+    where: "Hall",
+    recurrence: "",
+    attendees: [],
+    notes: "<p>" + "a".repeat(12050) + "</p>",
+  },
+};
+const events = {
+  "2026-11-12": [
+    {
+      id: "evt-maths", copies: 2, title: "Specialist Maths", location: "Room 4", allDay: false,
+      start: "2026-11-12T09:00:00+11:00", startText: "9:00 AM",
+      end: "2026-11-12T10:15:00+11:00", endText: "10:15 AM",
+    },
+    {
+      id: "evt-chem", title: "Chemistry prac", location: "Lab 2", allDay: false,
+      start: "2026-11-12T13:00:00+11:00", startText: "1:00 PM",
+      end: "2026-11-12T14:30:00+11:00", endText: "2:30 PM",
+    },
+  ],
+  "2026-11-13": [
+    { id: "evt-assembly", title: "Assembly", location: "Hall", allDay: true },
+  ],
+};
+const match = location.pathname.match(/\/(\d{4})\/(\d{2})\/(\d{2})$/);
+let current = mode === "url" && match ? match[1] + "-" + match[2] + "-" + match[3] : "2026-11-12";
+const grid = document.querySelector("#grid");
+const heading = document.querySelector("[data-testid=calendar-date]");
+const peek = document.querySelector("[data-testid=event-peek]");
+window.__actions = [];
+window.__clicks = {};
+
+function card(event) {
+  const label = event.allDay
+    ? event.title + ", all day, " + event.location
+    : event.title + ", " + event.startText + " to " + event.endText + ", " + event.location;
+  const times = event.allDay ? ""
+    : '<time data-testid="event-start" datetime="' + event.start + '">' + event.startText + "</time>"
+      + '<time data-testid="event-end" datetime="' + event.end + '">' + event.endText + "</time>";
+  return '<div role="button" tabindex="0" data-testid="calendar-event" data-event-id="' + event.id
+    + '" data-all-day="' + (event.allDay ? "true" : "false") + '" aria-label="' + label + '">'
+    + '<span data-testid="event-title">' + event.title + "</span>" + times
+    + '<span data-testid="event-location">' + event.location + "</span></div>";
+}
+
+function render() {
+  heading.setAttribute("data-date", current);
+  heading.textContent = headings[current] || current;
+  grid.setAttribute("aria-label", heading.textContent);
+  grid.replaceChildren();
+  if (!drop) {
+    for (const event of events[current] || []) {
+      for (let copy = 0; copy < (event.copies || 1); copy++) grid.insertAdjacentHTML("beforeend", card(event));
+    }
+    if (current === "2026-11-12") {
+      grid.insertAdjacentHTML("beforeend",
+        '<button type="button" data-action="slot" aria-label="Thursday, 12 November 2026, 11:00 AM to 11:30 AM, create event">11:00 AM</button>');
+    }
+  }
+}
+
+function openPeek(id) {
+  const item = catalog[id];
+  if (!item) return;
+  window.__clicks[id] = (window.__clicks[id] || 0) + 1;
+  peek.querySelector("[data-testid=event-heading]").textContent = item.title;
+  peek.querySelector("[data-testid=event-when]").textContent = item.when;
+  peek.querySelector("[data-testid=event-where]").textContent = item.where;
+  const recurrence = peek.querySelector("[data-testid=event-recurrence]");
+  recurrence.hidden = !item.recurrence;
+  recurrence.textContent = item.recurrence;
+  peek.querySelector("[data-testid=event-attendees]").innerHTML = item.attendees.map(person =>
+    '<li role="listitem"><span data-testid="attendee-name">' + person[0] + "</span>"
+    + '<span data-testid="attendee-status">' + person[1] + "</span></li>").join("");
+  peek.querySelector("[data-testid=event-notes]").innerHTML = item.notes;
+  peek.hidden = false;
+}
+
+document.querySelector("main").addEventListener("click", event => {
+  const action = event.target.closest("[data-action]");
+  if (action) {
+    event.preventDefault();
+    window.__actions.push(action.dataset.action);
+    return;
+  }
+  const cardNode = event.target.closest("[data-event-id]");
+  if (cardNode) openPeek(cardNode.dataset.eventId);
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") peek.hidden = true;
+});
+document.getElementById("prev").addEventListener("click", () => shift(-1));
+document.getElementById("next").addEventListener("click", () => shift(1));
+function shift(days) {
+  const [year, month, day] = current.split("-").map(Number);
+  const next = new Date(Date.UTC(year, month - 1, day + days));
+  current = next.toISOString().slice(0, 10);
+  render();
+}
+const input = document.getElementById("date");
+if (mode === "input") {
+  input.hidden = false;
+  input.value = current;
+  document.getElementById("prev").hidden = true;
+  document.getElementById("next").hidden = true;
+  const apply = () => {
+    if (!input.value) return;
+    current = input.value;
+    render();
+  };
+  input.addEventListener("input", apply);
+  input.addEventListener("change", apply);
+}
+render();
+</script>

@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Calendar</title>
+<!--
+  Sanitized day view with no data-date and no data-testid="calendar-event".
+  The date is an English heading and the events are aria-labels only.
+-->
+<main data-testid="calendar-surface" aria-label="Calendar">
+  <h1 data-testid="calendar-date">Thursday, 12 November 2026</h1>
+  <div role="grid" aria-label="Thursday, 12 November 2026" style="min-height:40px">
+    <button type="button" aria-label="Staff meeting, all day, Staff room">Staff meeting</button>
+    <button type="button" aria-label="Pastoral, 8:30 AM to 8:45 AM, Courtyard">Pastoral</button>
+  </div>
+  <div role="dialog" data-testid="event-peek" aria-label="Event details" hidden>
+    <h2 data-testid="event-heading">Pastoral</h2>
+    <div data-testid="event-when">Thursday, 12 November 2026 8:30 AM – 8:45 AM</div>
+    <div data-testid="event-where">Courtyard</div>
+    <ul data-testid="event-attendees" aria-label="Attendees"></ul>
+    <div data-testid="event-notes"><p>Roll call</p></div>
+    <button type="button" data-action="accept">Accept</button>
+  </div>
+</main>
+<script>
+window.__actions = [];
+document.querySelector("main").addEventListener("click", event => {
+  const action = event.target.closest("[data-action]");
+  if (action) {
+    event.preventDefault();
+    window.__actions.push(action.dataset.action);
+    return;
+  }
+  const button = event.target.closest("button");
+  if (!button || !button.getAttribute("aria-label").startsWith("Pastoral")) return;
+  document.querySelector("[data-testid=event-peek]").hidden = false;
+});
+</script>

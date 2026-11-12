@@ -1,6 +1,6 @@
 # Outlook Web MCP
 
-A read-only TypeScript MCP server with four tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and message IDs. Read returns available message metadata, Markdown and attachment names. Attachments are returned as the original file for the model to read. Search scrolls the on-screen result list and returns only rows the adapter can identify. `mail_status` reports sign-in diagnostics and does not read mail.
+A read-only TypeScript MCP server with six tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and message IDs. Read returns available message metadata, Markdown and attachment names. Attachments are returned as the original file for the model to read. Search scrolls the on-screen result list and returns only rows the adapter can identify. `mail_status` reports sign-in diagnostics and does not read mail. Calendar search reads events rendered in day view; read_event returns their details and notes.
 
 This is an unofficial browser adapter, with no Microsoft Graph API registration
 required. It is not affiliated with Microsoft. Opening a message can mark it as
@@ -27,12 +27,18 @@ exposed tools: there is no send, reply, delete, move, or general flag action.
 | `read_mail` | `message_id` from `search_mail` | sender, `to`, `cc`, `received_at`, `attachment_names`, `body_markdown`, `truncated` |
 | `read_attachment` | `message_id`, `attachment` (index into `attachment_names` or exact file name) | Text metadata: `name`, `size_bytes`, `mime`, `kind: download`, `download_url`, `expires_at` |
 | `mail_status` | none | `auth`, `browser`, `busy`, `last_success_at`, `last_error`, and whether `OUTLOOK_PASSWORD_FILE` is configured and valid. `password_file_path` is included when configured. It does not read mail, sign in, or sign out. |
+| `search_events` | `start` and `end` (`YYYY-MM-DD`, end inclusive, at most 14 days), optional `query`, `limit` 1–25 | `event_id`, title, `start`, `end`, `all_day`, location and `date` for each rendered event |
+| `read_event` | `event_id` from `search_events` | times, location, attendees, recurrence, `body_markdown`, `truncated` |
 
 Attachments are fetched with Outlook's own **Download** command, read into memory, deleted straight away and returned unchanged; the server does not convert or extract anything, so it is up to your MCP client and model to read PDFs or Office files. Files over 25 MB are refused (`OUTLOOK_ATTACHMENT_MAX_MB`); large files make large responses, so lower the limit if your client struggles. Set `OUTLOOK_ATTACHMENTS=0` to remove the tool. Cloud (OneDrive/SharePoint) links cannot be downloaded.
 
 `search_mail` scrolls Outlook’s result list until it has `limit` identifiable rows or the list stops rendering more. It still does not call a mail API, and it skips rows whose sender or subject it cannot see, so a broad query can return fewer hits than `limit`. Narrow queries stay faster and less ambiguous. When a conversation shows several expanded messages, `read_mail` returns each body separated by `---`. Images are blocked; their alt text appears as `(image: …)`. Bodies are capped at 12,000 characters.
 
 A result row with an Outlook item id (`data-item-id`) or conversation id (`data-convid`), including on a descendant of the row, gets a stable `ow1.` message ID. That ID embeds the search query plus the Outlook id, sender, subject, time and preview, so `read_mail` and `read_attachment` can run the search again and match the same row after a server restart or after the 30-minute in-memory cache expires. Treat the token as opaque mailbox metadata. Rows without either attribute still get a random UUID. Those temporary IDs, including ones already issued, keep working until they expire or the process restarts. A stable ID that no longer matches a single row returns `MESSAGE_CHANGED`.
+
+`search_events` reads Outlook's day view from `start` through `end`. If you omit the dates, it uses the day the calendar opens. `query` filters the rendered title and location; it is not Outlook search syntax and does not look outside that range. `event_id` expires after 30 minutes, as temporary mail IDs do. `read_event` opens that event's details peek. Notes use the same Markdown rules as mail: images become alt text, links are not followed, and the body is capped at 12,000 characters.
+
+A calendar request confirms the signed-in mailbox, then uses a separate tab so the mail list stays put. The tools never create, edit, delete or respond to events. A single click opens the peek. Accept, Tentative, Decline, Edit, Delete and Save are not clicked. If Outlook opens the editor instead of the peek, the adapter closes it and discards unsaved changes. Only calendars already selected in Outlook are visible, and only the events drawn for each requested day. The date is read from a machine-readable attribute when Outlook provides one, otherwise from an English heading such as "12 November 2026". Times are returned as Outlook renders them, including a datetime attribute when one is present. An aria-label without structured fields is parsed on commas, so a title that itself contains a comma can be cut short.
 
 ## Local setup
 
@@ -122,6 +128,8 @@ Temporary search result IDs expire after 30 minutes or on server restart. Stable
 - `UNKNOWN_MESSAGE`: the ID is unknown, malformed, or a temporary ID that expired. Search again.
 - `MESSAGE_CHANGED`: the result moved or no longer matches one row. Search again.
 - `AUTH_REQUIRED`: sign-in is required. The message says which: the password file is misconfigured (path and reason, plus similar filenames when it is missing), the Microsoft session expired (`npm run login`), a login window is already open, or another case such as a cooldown after automatic sign-in failed.
+- `UNKNOWN_EVENT` / `EVENT_CHANGED`: the event ID expired or that event is no longer the same item. Search again.
+- `INVALID_RANGE`: the dates, query or limit cannot be used. Ranges are real `YYYY-MM-DD` dates of at most 14 days.
 - `SIGNED_OUT`: `npm run logout` is running.
 - `NETWORK_ERROR`: Outlook could not be reached.
 - `TIMEOUT`: Outlook was slow. If one request runs longer than 90 seconds, the browser is reset. Retry.
@@ -130,7 +138,7 @@ Temporary search result IDs expire after 30 minutes or on server restart. Stable
 - `UI_CHANGED`: the adapter could not identify a search region, row or reading pane. Outlook error pages get one automatic reload first.
 - `BROWSER_ERROR`: anything else.
 
-For `TIMEOUT`, `UI_CHANGED` and `BROWSER_ERROR`, the server prints the failing Playwright step to stderr. Outlook's DOM differs between accounts and changes over time. The selectors are in `src/outlook.ts`, and the fixture in `test/mail.test.mjs` mirrors the layout they were checked against (`outlook.cloud.microsoft`, November 2026).
+For `TIMEOUT`, `UI_CHANGED` and `BROWSER_ERROR`, the server prints the failing Playwright step to stderr. Outlook's DOM differs between accounts and changes over time. The mail selectors are in `src/outlook.ts`, and the fixture in `test/mail.test.mjs` mirrors the layout they were checked against (`outlook.cloud.microsoft`, November 2026). Calendar selectors are in `src/calendar.ts`. The sanitized pages in `test/fixtures/calendar/` mirror the day view and event peek they target. Neither fixture is a live mailbox.
 
 Email fields are untrusted source data. The worker blocks images during mailbox operations and does not follow email links. It downloads an attachment only when `read_attachment` asks for it, never opens or runs it, and keeps a temporary copy for up to 30 minutes for download. Attachment content is untrusted in the same way as email bodies. The server does not store email bodies. Your MCP client and model provider may receive and retain returned content according to their own settings.
 

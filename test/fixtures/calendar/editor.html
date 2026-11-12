@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Calendar</title>
+<!-- Sanitized day view whose click opens an editor instead of the read-only peek. -->
+<main data-testid="calendar-surface" aria-label="Calendar">
+  <h1 data-testid="calendar-date" data-date="2026-11-12">Thursday, 12 November 2026</h1>
+  <div role="grid" aria-label="Thursday, 12 November 2026" style="min-height:40px">
+    <div role="button" tabindex="0" data-testid="calendar-event" data-event-id="evt-lab" aria-label="Lab review, 2:00 PM to 2:30 PM, Lab 1">
+      <span data-testid="event-title">Lab review</span>
+      <time data-testid="event-start" datetime="2026-11-12T14:00:00+11:00">2:00 PM</time>
+      <time data-testid="event-end" datetime="2026-11-12T14:30:00+11:00">2:30 PM</time>
+      <span data-testid="event-location">Lab 1</span>
+    </div>
+  </div>
+  <div role="dialog" aria-label="Edit event" id="editor" hidden>
+    <input aria-label="Add a title" value="Lab review">
+    <button type="button" id="save">Save</button>
+  </div>
+  <div role="dialog" aria-label="Discard changes" id="confirm" hidden>
+    <button type="button" id="discard">Discard</button>
+    <button type="button" id="confirm-save">Save</button>
+  </div>
+</main>
+<script>
+window.__actions = [];
+document.querySelector("[data-testid=calendar-event]").addEventListener("click", () => {
+  document.querySelector("#editor").hidden = false;
+});
+for (const id of ["save", "confirm-save", "discard"]) {
+  document.getElementById(id).addEventListener("click", () => window.__actions.push(id === "confirm-save" ? "save" : id));
+}
+document.addEventListener("keydown", event => {
+  if (event.key !== "Escape" || document.querySelector("#editor").hidden) return;
+  document.querySelector("#editor").hidden = true;
+  document.querySelector("#confirm").hidden = false;
+});
+document.getElementById("discard").addEventListener("click", () => {
+  document.querySelector("#confirm").hidden = true;
+});
+</script>

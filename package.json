@@ -1,7 +1,7 @@
 {
   "name": "outlook-mcp",
   "version": "1.1.0",
-  "description": "Read-only MCP server for searching and reading Outlook Web mail through a signed-in Playwright browser",
+  "description": "Read-only MCP server for searching and reading Outlook Web mail and calendar through a signed-in Playwright browser",
   "scripts": {
     "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "test": "npm run build && node --test test/*.test.mjs",

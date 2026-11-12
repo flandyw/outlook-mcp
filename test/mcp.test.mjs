@@ -11,7 +11,7 @@ import { once } from "node:events";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-test("serves read-only tools over authenticated Streamable HTTP", async t => {
+test("serves read-only mail and calendar tools over authenticated Streamable HTTP", async t => {
   const socket = createServer().listen(0, "127.0.0.1");
   await once(socket, "listening");
   const port = socket.address().port;
@@ -45,7 +45,7 @@ test("serves read-only tools over authenticated Streamable HTTP", async t => {
   t.after(() => client.close());
   await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers } }));
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map(tool => tool.name), ["search_mail", "read_mail", "read_attachment", "mail_status"]);
+  assert.deepEqual(tools.map(tool => tool.name), ["search_mail", "read_mail", "read_attachment", "mail_status", "search_events", "read_event"]);
   assert.ok(tools.every(tool => tool.annotations.readOnlyHint));
   const statusTool = tools.find(tool => tool.name === "mail_status");
   assert.equal(statusTool.annotations.destructiveHint, false);
@@ -66,12 +66,21 @@ test("serves read-only tools over authenticated Streamable HTTP", async t => {
   assert.equal(diagnostics.profile, undefined);
   assert.equal(JSON.stringify(diagnostics).includes(canary), false);
   assert.deepEqual(tools.map(tool => tool.name).filter(name => /login|logout|send|reply|delete|move|flag/i.test(name)), []);
+  const searchEvents = tools.find(tool => tool.name === "search_events");
+  assert.ok(searchEvents.inputSchema.properties.start);
+  assert.ok(searchEvents.inputSchema.properties.query);
   const response = await client.callTool({
     name: "read_mail",
     arguments: { message_id: "69d17491-5c2e-435d-b756-6c59752e2862" },
   });
   assert.equal(response.isError, true);
   assert.match(response.content[0].text, /UNKNOWN_MESSAGE/);
+  const event = await client.callTool({
+    name: "read_event",
+    arguments: { event_id: "69d17491-5c2e-435d-b756-6c59752e2862" },
+  });
+  assert.equal(event.isError, true);
+  assert.match(event.content[0].text, /UNKNOWN_EVENT/);
 
   // Malformed JSON and non-object payloads must not become internal errors.
   for (const payload of ["{", "null", "[]", "42"]) {

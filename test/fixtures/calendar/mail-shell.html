@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mail</title>
+<!-- Sanitized mailbox shell so a calendar request can confirm the session without a live account. -->
+<input id="topSearchInput" aria-label="Search">
+<section id="MailList" hidden>
+  <div role="listbox">
+    <div role="option" data-item-id="1" aria-label="Maya Chen Delivery window">
+      <span data-testid="sender">Maya Chen</span>
+      <span data-testid="subject">Delivery window</span>
+      <span data-testid="preview">The courier confirmed Friday.</span>
+      <time datetime="2026-11-11T10:42:00+11:00">10:42</time>
+    </div>
+  </div>
+</section>
+<section aria-label="Reading Pane" hidden>
+  <h2>Delivery window</h2>
+  <div role="document"><p>The courier confirmed Friday.</p></div>
+</section>
+<script>
+document.querySelector("input").addEventListener("keydown", event => {
+  if (event.key !== "Enter") return;
+  fetch("/searchservice/api/v2/query", { method: "POST" }).then(() => {
+    document.querySelector("#MailList").hidden = false;
+  });
+});
+document.querySelector('[role="option"]').addEventListener("click", () => {
+  document.querySelector('[aria-label="Reading Pane"]').hidden = false;
+});
+</script>

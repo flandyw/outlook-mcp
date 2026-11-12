@@ -12,24 +12,24 @@ const maxSpanDays = 13;
 
 const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
 
-// Selectors target the day-view structure in test/fixtures/calendar (November 2026):
+// Selectors cover the observed Outlook CalendarModule / Surface_Day layout and fixtures:
 // a calendar surface, a date heading, event buttons in the day grid, and a details peek.
 // A missing surface or grid is UI_CHANGED rather than a guess.
 const selectors = {
-  surface: '[data-testid="calendar-surface"]',
+  surface: '[data-testid="calendar-surface"], [data-app-section="CalendarModule"]',
   date: '[data-testid="calendar-date"]',
-  event: '[data-testid="calendar-event"], [role="grid"] [role="button"], [role="grid"] button',
+  event: '[data-testid="calendar-event"], [role="grid"] [role="button"], [role="grid"] button, [data-app-section="Surface_Day"] [role="button"][aria-label]',
   title: "[data-testid='event-title']",
   start: "[data-testid='event-start']",
   end: "[data-testid='event-end']",
   location: "[data-testid='event-location']",
-  peek: '[data-testid="event-peek"], [role="dialog"]',
-  heading: '[data-testid="event-heading"], [role="heading"], h1, h2',
-  when: "[data-testid='event-when']",
-  where: "[data-testid='event-where']",
+  peek: '[data-testid="event-peek"], [role="dialog"], [data-app-section="CalendarItemPeek"]',
+  heading: '[data-testid="event-heading"], [aria-label="Title"], [role="heading"], h1, h2',
+  when: "[data-testid='event-when'], [aria-label='Time']",
+  where: "[data-testid='event-where'], [aria-label='Location']",
   recurrence: "[data-testid='event-recurrence']",
   attendee: "[data-testid='event-attendees'] [role='listitem']",
-  notes: "[data-testid='event-notes']",
+  notes: "[data-testid='event-notes'], [aria-label='Description'], [aria-label='Notes']",
 };
 
 type RawEvent = {
@@ -216,11 +216,11 @@ export class Calendar {
     return page.locator(selectors.surface).or(page.getByRole("main", { name: /^calendar$/i })).first();
   }
 
-  private dayUrl(date?: string) {
+  private dayUrl(date?: string, origin = mailbox.origin) {
     const path = date ? "/calendar/view/day/" + date.replaceAll("-", "/") : "/calendar/view/day";
     // A unique query avoids the browser treating a repeat of the same day as a no-op,
     // so each day is read from a fresh document.
-    return mailbox.origin + path + "?_=" + (++this.nav);
+    return origin + path + "?_=" + (++this.nav);
   }
 
   private async pageFor(context: BrowserContext) {
@@ -243,11 +243,11 @@ export class Calendar {
 
   private async waitForCalendar(page: Page) {
     const surface = this.surface(page);
-    const surfaceWait = surface.waitFor({ state: "visible", timeout: 8000 }).then(() => true, () => false);
+    const surfaceWait = surface.waitFor({ state: "visible", timeout: 20000 }).then(() => true, () => false);
     const loginWait = page.waitForURL(url => {
       const value = typeof url === "string" ? url : url.toString();
       return signInOrigins.has(safeOrigin(value));
-    }, { timeout: 8000 }).then(() => true, () => false);
+    }, { timeout: 20000 }).then(() => true, () => false);
     const winner = await Promise.race([
       loginWait.then(seen => seen ? "login" as const : "later" as const),
       surfaceWait.then(seen => seen ? "surface" as const : "later" as const),
@@ -263,6 +263,11 @@ export class Calendar {
   }
 
   private async readShownDate(page: Page) {
+    const columns = this.surface(page).locator('[data-app-section="Surface_Day"] [data-column-date]');
+    if (await columns.count()) {
+      const dates = await columns.evaluateAll(nodes => [...new Set(nodes.map(n => n.getAttribute("data-column-date")))]);
+      if (dates.length === 1 && dates[0] && /^\d{4}-\d{2}-\d{2}$/.test(dates[0])) return dates[0];
+    }
     const dated = this.surface(page).locator(selectors.date).first();
     if (await dated.count()) {
       const iso = await dated.getAttribute("data-date");
@@ -276,15 +281,10 @@ export class Calendar {
     return parsed;
   }
 
-  private async dateMarker(page: Page) {
-    return this.surface(page).locator(selectors.date).first().evaluate(node =>
-      node.getAttribute("data-date") || (node.textContent ?? "").trim()).catch(() => "");
-  }
-
   private async stepButton(page: Page, direction: "next" | "previous") {
     const surface = this.surface(page);
     const specific = surface.getByRole("button", { name: direction === "next" ? /next day/i : /previous day/i }).first();
-    if (await specific.isVisible().catch(() => false)) return specific;
+    if (await specific.waitFor({ state: "visible", timeout: 3000 }).then(() => true, () => false)) return specific;
     const broad = surface.getByRole("button", { name: direction === "next" ? /^next$/i : /^previous$/i }).first();
     if (await broad.isVisible().catch(() => false)) return broad;
     return null;
@@ -304,14 +304,11 @@ export class Calendar {
       if (shown === date) return;
       const button = await this.stepButton(page, shown < date ? "next" : "previous");
       if (!button) break;
-      const marker = await this.dateMarker(page);
       await button.click();
-      await page.waitForFunction(previous => {
-        const node = document.querySelector("[data-testid='calendar-date']");
-        if (!node) return false;
-        const next = node.getAttribute("data-date") || (node.textContent ?? "").trim();
-        return next !== "" && next !== previous;
-      }, marker, { timeout: 4000 }).catch(() => {});
+      for (let attempt = 0; attempt < 40; attempt++) {
+        if (await this.readShownDate(page).catch(() => shown) !== shown) break;
+        await page.waitForTimeout(100);
+      }
     }
     if (await this.readShownDate(page) !== date) {
       throw new MailError("UI_CHANGED", "Could not open the requested calendar day.");
@@ -319,8 +316,15 @@ export class Calendar {
   }
 
   private async openDay(page: Page, date?: string) {
-    await page.goto(this.dayUrl(date), { waitUntil: "domcontentloaded", timeout: 20000 });
+    const origin = outlookOrigins.has(safeOrigin(page.url())) ? safeOrigin(page.url()) : mailbox.origin;
+    await page.goto(this.dayUrl(date, origin), { waitUntil: "domcontentloaded", timeout: 20000 });
     await this.waitForCalendar(page);
+    if (await page.locator('[data-app-section="CalendarModule"]').count()) {
+      if (!await page.locator('[data-app-section="Surface_Day"]').count()) {
+        await page.getByRole("button", { name: "Day", exact: true }).click();
+      }
+      await page.locator('[data-app-section="Surface_Day"] [data-column-date]').first().waitFor({ state: "attached" });
+    }
     if (!date) return this.readShownDate(page);
     await this.alignDate(page, date);
     const shown = await this.readShownDate(page);
@@ -329,9 +333,13 @@ export class Calendar {
   }
 
   private async collect(page: Page, date: string): Promise<ListedEvent[]> {
-    const grid = this.surface(page).locator('[role="grid"]').first();
+    const grid = this.surface(page).locator('[role="grid"], [data-app-section="Surface_Day"] [data-app-section="calendar-view-0"]').first();
     const attached = await grid.waitFor({ state: "attached", timeout: 8000 }).then(() => true, () => false);
     if (!attached) throw new MailError("UI_CHANGED", "Could not identify the calendar day grid.");
+    if (await page.locator('[data-app-section="Surface_Day"]').count()) {
+      await page.locator('[aria-live="polite"]').getByText(/^Loaded \d+ events? in /).first()
+        .waitFor({ state: "attached", timeout: 15000 });
+    }
     const extracted = await this.surface(page).locator(selectors.event).evaluateAll((nodes, day: string) => {
       const weekdays = /^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)$/i;
       const range = /(\d{1,2}:\d{2}\s*(?:[AP]M)?)(?:\s*(?:to|–|—|-)\s*(\d{1,2}:\d{2}\s*(?:[AP]M)?))/i;
@@ -342,6 +350,7 @@ export class Calendar {
         const time = label.match(range);
         let location: string | null = null;
         for (const part of parts.slice(1)) {
+          if (/^(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(part) || /^\d{4}$/.test(part) || /^Categorized as /i.test(part)) continue;
           if (/\ball[- ]day\b/i.test(part) || range.test(part) || /^\d{1,2}:\d{2}\s*(?:[AP]M)?$/i.test(part) || /^by\s/i.test(part)) continue;
           if (/^(recurring|recurs|private|busy|free|tentative|organizer)$/i.test(part)) continue;
           location = part;

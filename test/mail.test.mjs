@@ -120,6 +120,9 @@ test("reads the real body, recipients and attachments from the modern layout", a
   const hits = await outlook.search("plan", 10);
   assert.equal(hits.messages.length, 2, "duplicate keyed rows collapse to one result");
   assert.equal(hits.ambiguous_results_omitted, 0);
+  assert.match(hits.messages[0].message_id, /^ow1\./);
+  assert.match(hits.messages[1].message_id, /^ow1\./);
+  assert.notEqual(hits.messages[0].message_id, hits.messages[1].message_id);
   assert.equal(hits.messages[0].has_attachments, true);
   const message = await outlook.read(hits.messages[0].message_id);
   assert.equal(message.body_markdown,
@@ -143,9 +146,9 @@ test("reads the real body, recipients and attachments from the modern layout", a
   assert.equal(second.received_at, "Tue 2026-11-10 08:00");
 });
 
-// Outlook renders only the rows near the viewport. Opening messages scrolls the list, so a row from an
-// earlier search may no longer exist in the page until the list is scrolled back to it.
-test("finds a message whose row was virtualized out of the list", async t => {
+// Outlook paints only the rows near the viewport (here, 4 of 30). Search scrolls for more, and opening
+// a message jumps the list, so an earlier row may leave the DOM until the list is scrolled back to it.
+test("honors limit past the first painted page and can reopen a virtualized row", async t => {
   const browser = await launchChromium();
   t.after(() => browser.close());
   const context = await browser.newContext();
@@ -182,10 +185,141 @@ test("finds a message whose row was virtualized out of the list", async t => {
       </script>`,
   }));
   const outlook = new Outlook(async () => context);
-  const hits = await outlook.search("subject", 10);
-  assert.equal(hits.messages.length, 4);
+  const first = await outlook.search("subject", 1);
+  assert.deepEqual(first.messages.map(message => message.subject), ["Subject 0"]);
+  const hits = await outlook.search("subject", 25);
+  assert.deepEqual(hits.messages.map(message => message.subject),
+    Array.from({ length: 25 }, (_, index) => "Subject " + index));
+  assert.match(hits.messages[24].message_id, /^ow1\./);
+  assert.equal((await outlook.read(hits.messages[24].message_id)).body_markdown, "Body 24");
+  // Opening a message jumps the list to the bottom, so these rows are no longer in the DOM.
   assert.equal((await outlook.read(hits.messages[3].message_id)).body_markdown, "Body 3");
-  // The list is now scrolled to the bottom and rows 0-3 are gone from the page.
   assert.equal((await outlook.read(hits.messages[1].message_id)).body_markdown, "Body 1");
   assert.equal((await outlook.read(hits.messages[0].message_id)).body_markdown, "Body 0");
+});
+
+test("rejects malformed message ids before opening the browser", async () => {
+  const outlook = new Outlook(async () => { throw new Error("browser should stay closed"); });
+  const incomplete = "ow1." + Buffer.from(JSON.stringify({ v: 1, q: "courier" })).toString("base64url");
+  await assert.rejects(outlook.read("ow1.bm90LWpzb24"), { code: "UNKNOWN_MESSAGE" });
+  await assert.rejects(outlook.read(incomplete), { code: "UNKNOWN_MESSAGE" });
+  await assert.rejects(outlook.downloadAttachment(incomplete, 0, 100), { code: "UNKNOWN_MESSAGE" });
+});
+
+test("keeps stable ids usable after expiry and restart, and temporary ids until they expire", async t => {
+  const browser = await launchChromium();
+  t.after(() => browser.close());
+  const context = await browser.newContext();
+  await context.route("https://outlook.office.com/**", route => route.fulfill({
+    contentType: "text/html",
+    body: `<input id="topSearchInput" aria-label="Search">
+      <div id="MailList" hidden><div role="listbox" id="rows"></div></div>
+      <div role="main" aria-label="Reading Pane">
+        <span role="heading" id="subject"></span>
+        <div id="UniqueMessageBody_1" role="document" aria-label="Message body">
+          <p id="body-text"></p>
+          <button type="button" id="decoy" aria-label="Mark as unread" style="width:24px;height:24px"></button>
+        </div>
+        <button type="button" id="unread">Mark as unread</button>
+      </div>
+      <script>
+      window.__restored = 0;
+      window.__bodyClicks = 0;
+      document.querySelector('#decoy').addEventListener('click', () => { window.__bodyClicks += 1; });
+      document.querySelector('#unread').addEventListener('click', () => { window.__restored += 1; });
+      const paint = () => {
+        document.querySelector('#rows').innerHTML = \`
+          <div role="option" aria-label="Unread Ada Durable note">
+            <span data-item-id="item-durable" hidden></span>
+            <span data-testid="sender">Ada</span>
+            <span data-testid="subject">Durable note</span>
+            <span data-testid="preview">Kept</span>
+            <time datetime="2026-11-01T00:00:00Z"></time>
+          </div>
+          <div role="option" aria-label="Bea Temporary note">
+            <span data-testid="sender">Bea</span>
+            <span data-testid="subject">Temporary note</span>
+            <span data-testid="preview">Ephemeral</span>
+            <time datetime="2026-11-02T00:00:00Z"></time>
+          </div>
+          <div role="option" data-convid="conv-thread" aria-label="Cara Thread note">
+            <span data-testid="sender">Cara</span>
+            <span data-testid="subject">Thread note</span>
+            <span data-testid="preview">Earlier</span>
+            <time datetime="2026-11-03T00:00:00Z"></time>
+          </div>
+          <div role="option" data-convid="conv-thread" aria-label="Cara Thread note">
+            <span data-testid="sender">Cara</span>
+            <span data-testid="subject">Thread note</span>
+            <span data-testid="preview">Later</span>
+            <time datetime="2026-11-04T00:00:00Z"></time>
+          </div>
+          <div role="option" aria-label="Ada Unread books are due">
+            <span data-item-id="item-subject"></span>
+            <span data-testid="sender">Ada</span>
+            <span data-testid="subject">Unread books are due</span>
+            <span data-testid="preview">Not a status</span>
+            <time datetime="2026-11-05T00:00:00Z"></time>
+          </div>\`;
+        for (const option of document.querySelectorAll('#rows [role=option]')) {
+          option.addEventListener('click', () => {
+            const subject = option.querySelector('[data-testid=subject]').textContent;
+            document.querySelector('#subject').textContent = subject;
+            document.querySelector('#body-text').textContent = 'Body ' + subject;
+          });
+        }
+      };
+      document.querySelector('input').addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        fetch('/searchservice/api/v2/query', { method: 'POST' }).then(() => {
+          document.querySelector('#MailList').hidden = false;
+          paint();
+        });
+      });
+      </script>`,
+  }));
+  const bySubject = (result, subject) => result.messages.find(message => message.subject === subject);
+  const flags = () => context.pages()[0].evaluate(() => ({ restored: window.__restored, bodyClicks: window.__bodyClicks }));
+  const outlook = new Outlook(async () => context);
+  const hits = await outlook.search("note", 10);
+  const stable = bySubject(hits, "Durable note").message_id;
+  const temporary = bySubject(hits, "Temporary note").message_id;
+  const earlier = bySubject(hits, "Thread note");
+  const later = hits.messages.filter(message => message.subject === "Thread note")[1];
+  assert.match(stable, /^ow1\./);
+  assert.match(earlier.message_id, /^ow1\./);
+  assert.match(later.message_id, /^ow1\./);
+  assert.notEqual(earlier.message_id, later.message_id);
+  assert.match(temporary, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+  const again = await outlook.search("note", 10);
+  assert.equal(bySubject(again, "Durable note").message_id, stable);
+  assert.notEqual(bySubject(again, "Temporary note").message_id, temporary);
+  assert.deepEqual(await flags(), { restored: 0, bodyClicks: 0 });
+  // A subject that merely contains the word is not an unread status, so the toolbar button stays unclicked.
+  assert.equal((await outlook.read(bySubject(hits, "Unread books are due").message_id)).body_markdown, "Body Unread books are due");
+  assert.deepEqual(await flags(), { restored: 0, bodyClicks: 0 });
+  const durable = await outlook.read(stable);
+  assert.equal(durable.body_markdown, "Body Durable note");
+  assert.equal(durable.received_at, "2026-11-01T00:00:00Z");
+  assert.deepEqual(await flags(), { restored: 1, bodyClicks: 0 });
+  // The UUID from the first search is still in flight after a later search issued a new one.
+  assert.equal((await outlook.read(temporary)).subject, "Temporary note");
+  assert.deepEqual(await flags(), { restored: 1, bodyClicks: 0 });
+
+  const restarted = new Outlook(async () => context);
+  assert.equal((await restarted.read(stable)).subject, "Durable note");
+  assert.equal((await restarted.read(later.message_id)).received_at, "2026-11-04T00:00:00Z");
+  assert.equal((await restarted.read(earlier.message_id)).received_at, "2026-11-03T00:00:00Z");
+  await assert.rejects(restarted.read(temporary), { code: "UNKNOWN_MESSAGE" });
+  assert.equal((await flags()).bodyClicks, 0);
+
+  const short = new Outlook(async () => context, { referenceTtlMs: 30 });
+  const shortHits = await short.search("note", 10);
+  const shortStable = bySubject(shortHits, "Durable note").message_id;
+  const shortTemporary = bySubject(shortHits, "Temporary note").message_id;
+  assert.equal(shortStable, stable);
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal((await short.read(shortStable)).subject, "Durable note");
+  await assert.rejects(short.read(shortTemporary), { code: "UNKNOWN_MESSAGE" });
+  assert.equal((await outlook.read(temporary)).subject, "Temporary note");
 });

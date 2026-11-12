@@ -1,11 +1,15 @@
 # Outlook Web MCP
 
-A read-only TypeScript MCP server with three tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and temporary IDs. Read returns available message metadata, Markdown and attachment names. Attachments are returned as the original file for the model to read. Search covers the results currently rendered by Outlook, including only rows the adapter can identify.
+A read-only TypeScript MCP server with three tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and message IDs. Read returns available message metadata, Markdown and attachment names. Attachments are returned as the original file for the model to read. Search scrolls the on-screen result list and returns only rows the adapter can identify.
 
 This is an unofficial browser adapter, with no Microsoft Graph API registration
-required. It is not affiliated with Microsoft. Opening messages may mark them as
-read; “read-only” describes the exposed tools, not a guarantee of zero mailbox
-side effects.
+required. It is not affiliated with Microsoft. Opening a message can mark it as
+read. When the row’s accessible name starts with “Unread” (or it has a badge
+labeled exactly “Unread”) and Outlook shows a single **Mark as unread** button
+outside the message body, the adapter clicks that button after a successful
+read or attachment download. Buttons inside the message are ignored. If that
+control is missing, the message may stay read. “Read-only” describes the
+exposed tools: there is no send, reply, delete, move, or general flag action.
 
 ## Requirements
 
@@ -19,13 +23,15 @@ side effects.
 
 | Tool | Input | Returns |
 | --- | --- | --- |
-| `search_mail` | `query` (Outlook search syntax, e.g. `from:alice`, `subject:invoice`, `hasattachments:yes`), `limit` 1–25 | `message_id`, sender, subject, `received_at`, `has_attachments`, snippet for each rendered result |
+| `search_mail` | `query` (Outlook search syntax, e.g. `from:alice`, `subject:invoice`, `hasattachments:yes`), `limit` 1–40 | `message_id`, sender, subject, `received_at`, `has_attachments`, snippet for each identifiable result |
 | `read_mail` | `message_id` from `search_mail` | sender, `to`, `cc`, `received_at`, `attachment_names`, `body_markdown`, `truncated` |
 | `read_attachment` | `message_id`, `attachment` (index into `attachment_names` or exact file name) | Text metadata: `name`, `size_bytes`, `mime`, `kind: download`, `download_url`, `expires_at` |
 
 Attachments are fetched with Outlook's own **Download** command, read into memory, deleted straight away and returned unchanged; the server does not convert or extract anything, so it is up to your MCP client and model to read PDFs or Office files. Files over 25 MB are refused (`OUTLOOK_ATTACHMENT_MAX_MB`); large files make large responses, so lower the limit if your client struggles. Set `OUTLOOK_ATTACHMENTS=0` to remove the tool. Cloud (OneDrive/SharePoint) links cannot be downloaded.
 
-Outlook renders roughly the first 10–20 results, so narrow the query rather than raising `limit`. When a conversation shows several expanded messages, `read_mail` returns each body separated by `---`. Images are blocked; their alt text appears as `(image: …)`. Bodies are capped at 12,000 characters.
+`search_mail` scrolls Outlook’s result list until it has `limit` identifiable rows or the list stops rendering more. It still does not call a mail API, and it skips rows whose sender or subject it cannot see, so a broad query can return fewer hits than `limit`. Narrow queries stay faster and less ambiguous. When a conversation shows several expanded messages, `read_mail` returns each body separated by `---`. Images are blocked; their alt text appears as `(image: …)`. Bodies are capped at 12,000 characters.
+
+A result row with an Outlook item id (`data-item-id`) or conversation id (`data-convid`), including on a descendant of the row, gets a stable `ow1.` message ID. That ID embeds the search query plus the Outlook id, sender, subject, time and preview, so `read_mail` and `read_attachment` can run the search again and match the same row after a server restart or after the 30-minute in-memory cache expires. Treat the token as opaque mailbox metadata. Rows without either attribute still get a random UUID. Those temporary IDs, including ones already issued, keep working until they expire or the process restarts. A stable ID that no longer matches a single row returns `MESSAGE_CHANGED`.
 
 ## Local setup
 
@@ -42,7 +48,7 @@ npm run login
 
 `npm run login` opens a sign-in window. Complete Microsoft sign-in and MFA and choose **Stay signed in** when asked: that persistent sign-in is what lets the server run headless afterwards. The window closes by itself once Outlook loads. For Outlook.com, put `OUTLOOK_URL=https://outlook.live.com/mail/` in `.env` (the default is `https://outlook.office.com/mail/`).
 
-In Outlook's mail settings, disable automatic marking as read where available, and verify with an unread test message before using the server on real mail. Use a dedicated profile: logout deletes its directory. The profile lives in `~/.local/state/outlook-mcp/chromium` (`OUTLOOK_PROFILE`). Keep it private.
+Opening a message can mark it as read. Afterwards the adapter clicks a visible **Mark as unread** button outside the message body when the row was labeled unread. That click does not change Outlook’s settings, and it does nothing when the button is absent, so disable automatic marking as read where available and verify with an unread test message before using the server on real mail. Use a dedicated profile: logout deletes its directory. The profile lives in `~/.local/state/outlook-mcp/chromium` (`OUTLOOK_PROFILE`). Keep it private.
 
 ## Run as a service (recommended)
 
@@ -108,9 +114,10 @@ npm test
 
 Tests use Playwright's Chromium, falling back to `/usr/bin/chromium` on Linux (override with `CHROMIUM_PATH`). The tests exercise Chromium fixtures (including expired sessions, the account picker, crashes, hangs, network loss and sign-in/sign-out), the authenticated MCP handshake and the control socket. The fixture does not validate selectors against your signed-in Outlook layout. After sign-in, search for a known unread email, call `read_mail` with its returned ID, and verify its subject, body and unread state in Outlook.
 
-A search result ID expires after 30 minutes or on server restart. Error codes:
+Temporary search result IDs expire after 30 minutes or on server restart. Stable `ow1.` IDs do not. Error codes:
 
-- `UNKNOWN_MESSAGE` / `MESSAGE_CHANGED`: the ID expired or the result moved. Search again.
+- `UNKNOWN_MESSAGE`: the ID is unknown, malformed, or a temporary ID that expired. Search again.
+- `MESSAGE_CHANGED`: the result moved or no longer matches one row. Search again.
 - `AUTH_REQUIRED`: the browser needs a fresh sign-in (`npm run login`), or a sign-in window is open.
 - `SIGNED_OUT`: `npm run logout` is running.
 - `NETWORK_ERROR`: Outlook could not be reached.

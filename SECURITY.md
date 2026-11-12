@@ -8,6 +8,9 @@ private. Only use a profile dedicated to this application. Do not point
 The HTTP endpoint binds to loopback and requires a bearer token. Remote access
 requires a protected tunnel or reverse proxy and an appropriate access policy.
 The local control socket permits sign-in and profile deletion for your OS account.
+Startup, `npm run status`, and the read-only `mail_status` tool report whether
+the password file is configured and valid, including its path. They do not
+include the file contents. `mail_status` cannot sign in, sign out, or read mail.
 
 The tools do not send, reply, delete, or move mail, and they do not expose a
 flag action. Opening a message can still mark it as read. When the list row was

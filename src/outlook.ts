@@ -2,7 +2,7 @@ import type { BrowserContext, Locator, Page } from "playwright";
 import { randomUUID } from "node:crypto";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { launch, mailbox, outlookOrigins, profileDir, ProfileLockedError, safeOrigin } from "./browser.js";
-import { isMicrosoftLogin, reauthenticate, resumeSignIn } from "./reauth.js";
+import { inspectPasswordFile, isMicrosoftLogin, PasswordFileError, reauthenticate, resumeSignIn } from "./reauth.js";
 import { formatBody, type BodyPart } from "./format.js";
 
 export class MailError extends Error {
@@ -112,11 +112,13 @@ export interface OutlookOptions {
   /** Opens a visible browser for interactive sign-in. */
   launchVisible?: (display: Record<string, string>) => Promise<BrowserContext>;
   /** Called when the sign-in state changes because of a mail operation. */
-  onAuthChange?: (state: AuthState) => void;
+  onAuthChange?: (state: AuthState, detail?: { code: string; message: string; at: string }) => void;
 }
 
 const interactiveMode = () => process.env.OUTLOOK_INTERACTIVE === "1";
 const signInHelp = "Run npm run login on the server host to sign in again.";
+const sessionExpired = "Microsoft session expired. " + signInHelp;
+const loginWindowOpen = "A login window is already open on the server host.";
 
 export class Outlook {
   constructor(
@@ -145,19 +147,20 @@ export class Outlook {
       last_success_at: this.lastSuccessAt ?? null,
       last_error: this.lastError ?? null,
       profile: profileDir(),
+      password_file: inspectPasswordFile(),
     };
   }
 
-  private setAuth(state: AuthState) {
+  private setAuth(state: AuthState, detail?: { code: string; message: string; at: string }) {
     if (state === this.auth) return;
     this.auth = state;
-    this.options.onAuthChange?.(state);
+    this.options.onAuthChange?.(state, detail);
   }
 
   private busyError() {
     return this.busy === "logging_out"
       ? new MailError("SIGNED_OUT", "The mailbox is being signed out.")
-      : new MailError("AUTH_REQUIRED", "Sign-in is in progress in a browser window on the server host.");
+      : new MailError("AUTH_REQUIRED", loginWindowOpen);
   }
 
   private async ensurePage() {
@@ -210,7 +213,7 @@ export class Outlook {
     // Local diagnostics only. The first line of a Playwright error names the failed step.
     console.error("outlook-mcp: " + message);
     if (this.page && !this.page.isClosed() && isMicrosoftLogin(this.page)) {
-      return new MailError("AUTH_REQUIRED", "Microsoft asked for sign-in. " + signInHelp);
+      return new MailError("AUTH_REQUIRED", sessionExpired);
     }
     if (/net::ERR_(?:INTERNET_DISCONNECTED|NAME_NOT_RESOLVED|NAME_RESOLUTION|CONNECTION_|NETWORK_|ADDRESS_UNREACHABLE|PROXY_|TIMED_OUT)/.test(message)) {
       return new MailError("NETWORK_ERROR", "Could not reach Outlook. Check the network connection and try again.");
@@ -242,7 +245,7 @@ export class Outlook {
       } catch (error) {
         const failure = this.classify(error);
         this.lastError = { code: failure.code, message: failure.message, at: new Date().toISOString() };
-        if (failure.code === "AUTH_REQUIRED") this.setAuth("signed_out");
+        if (failure.code === "AUTH_REQUIRED") this.setAuth("signed_out", this.lastError);
         // A hung or crashed browser cannot be trusted with the next request.
         if (failure.code === "BROWSER_RESTARTED" || (failure.code === "TIMEOUT" && error === failure)) await this.shutdownBrowser();
         throw failure;
@@ -333,22 +336,30 @@ export class Outlook {
   private async recoverSession(page: Page) {
     if (!isMicrosoftLogin(page)) return;
     const username = process.env.OUTLOOK_USERNAME;
-    const passwordFile = process.env.OUTLOOK_PASSWORD_FILE;
     // A remembered account usually signs in again without a secret.
     const resumed = await resumeSignIn(page, username).catch(() => "needs_user" as const);
     if (resumed === "signed_in") return;
-    if (!username || !passwordFile) {
-      throw new MailError("AUTH_REQUIRED", "Microsoft needs you to sign in again. " + signInHelp);
+    const report = inspectPasswordFile();
+    if (report.configured && !report.valid) {
+      throw new MailError("AUTH_REQUIRED", report.message ?? "Password file misconfigured.");
+    }
+    if (!username || !report.configured || !report.path) {
+      throw new MailError("AUTH_REQUIRED", sessionExpired);
     }
     if (this.lastSignInAttempt !== undefined && Date.now() - this.lastSignInAttempt < 5 * 60_000) {
       throw new MailError("AUTH_REQUIRED", "Automatic sign-in is cooling down after a recent attempt. " + signInHelp);
     }
     this.lastSignInAttempt = Date.now();
     try {
-      await reauthenticate(page, username, passwordFile);
+      await reauthenticate(page, username, report.path);
       this.lastSignInAttempt = undefined;
-    } catch {
-      throw new MailError("AUTH_REQUIRED", "Automatic sign-in failed. Check the password file or " + signInHelp.toLowerCase());
+    } catch (error) {
+      // Browser errors can echo the password that was filled, so they are not forwarded.
+      if (error instanceof PasswordFileError) {
+        this.lastSignInAttempt = undefined;
+        throw new MailError("AUTH_REQUIRED", error.message);
+      }
+      throw new MailError("AUTH_REQUIRED", "Automatic sign-in failed. " + signInHelp);
     }
   }
 
@@ -370,7 +381,7 @@ export class Outlook {
     try {
       await this.recoverSession(page);
       if (page.url() !== "about:blank" && interactiveMode() && !outlookOrigins.has(safeOrigin(page.url()))) {
-        throw new MailError("AUTH_REQUIRED", "Complete sign-in in the browser window opened by the server.");
+        throw new MailError("AUTH_REQUIRED", loginWindowOpen + " Complete sign-in in that window.");
       }
       const stale = this.loadedAt > 0 && Date.now() - this.loadedAt > (this.options.reloadMs ?? 6 * 3600_000);
       if (!outlookOrigins.has(safeOrigin(page.url())) || stale) {
@@ -401,7 +412,7 @@ export class Outlook {
           throw new MailError("NETWORK_ERROR", "Could not reach Outlook. Check the network connection and try again.");
         }
         if (isMicrosoftLogin(page) || blockedNavigation || await this.signInPrompt(page)) {
-          throw new MailError("AUTH_REQUIRED", "Microsoft needs you to sign in again. " + signInHelp);
+          throw new MailError("AUTH_REQUIRED", sessionExpired);
         }
         throw new MailError("UI_CHANGED", "Could not find the Outlook search box.");
       }

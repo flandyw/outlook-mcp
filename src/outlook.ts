@@ -253,7 +253,7 @@ export class Outlook {
         this.lastError = { code: failure.code, message: failure.message, at: new Date().toISOString() };
         if (failure.code === "AUTH_REQUIRED") this.setAuth("signed_out", this.lastError);
         // A hung or crashed browser cannot be trusted with the next request.
-        if (failure.code === "BROWSER_RESTARTED" || (failure.code === "TIMEOUT" && error === failure)) await this.shutdownBrowser();
+        if (failure.code === "BROWSER_RESTARTED" || failure.code === "TIMEOUT") await this.shutdownBrowser();
         throw failure;
       } finally {
         clearTimeout(watchdog);

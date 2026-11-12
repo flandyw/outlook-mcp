@@ -9,8 +9,12 @@ The HTTP endpoint binds to loopback and requires a bearer token. Remote access
 requires a protected tunnel or reverse proxy and an appropriate access policy.
 The local control socket permits sign-in and profile deletion for your OS account.
 
-The tools do not intentionally send, delete, or modify mail. Opening a message
-can still mark it as read through Outlook's own settings. Returned email is
+The tools do not send, reply, delete, or move mail, and they do not expose a
+flag action. Opening a message can still mark it as read. When the list row was
+unread and Outlook shows exactly one visible button named "Mark as unread"
+outside the message body, the adapter clicks that button after a successful
+read or attachment download. Controls inside the message body are never
+clicked. If the button is absent, the message may stay read. Returned email is
 untrusted input and may contain prompt injection. Clients must treat it as data,
 not instructions. Returned content may be retained by the client or model provider.
 

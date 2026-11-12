@@ -29,9 +29,65 @@ const selectors = {
   // The card's "More actions" menu holds Download (checked on outlook.cloud.microsoft, Nov 2026).
   attachmentMenu: 'button[aria-haspopup="true"], button[aria-label="More actions"], [role="button"][aria-haspopup="true"]',
   recipients: { to: '[id$="_TO"][role="heading"]', cc: '[id$="_CC"][role="heading"]' },
+  // Item id identifies one message. Conversation id is the fallback and can be shared by several rows.
+  keyAttributes: ["data-item-id", "data-convid"],
 };
 
+const temporaryIdMs = 30 * 60_000;
+/** Upper bound for `search_mail`'s limit. Higher values only help when Outlook will render more rows. */
+export const searchResultLimit = 40;
+
 const hasKey = (row: Row) => Boolean(JSON.parse(row.fingerprint)[0]);
+
+function rowKey(row: Row) {
+  try {
+    const key: unknown = JSON.parse(row.fingerprint)[0];
+    return typeof key === "string" && key ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+// A stable id carries the query and the Outlook key so read_mail can search again after the
+// in-memory cache expires or the process restarts. Keyless rows keep a random UUID instead.
+function durableMessageId(query: string, row: Row) {
+  const key = rowKey(row);
+  if (!key || key.length > 500 || query.length < 1 || query.length > 300) return null;
+  if (row.sender.length > 500 || row.subject.length > 500 || row.time.length > 200) return null;
+  const encode = (preview: string) => {
+    const token = "ow1." + Buffer.from(JSON.stringify({
+      v: 1, q: query, k: key, s: row.sender, j: row.subject, t: row.time,
+      p: preview, a: row.hasAttachments ? 1 : 0,
+    })).toString("base64url");
+    return token.length <= 4096 ? token : null;
+  };
+  return encode(row.preview.length > 2000 ? "" : row.preview) ?? encode("");
+}
+
+function durableReference(id: string): Reference | null {
+  const token = /^ow1\.([A-Za-z0-9_-]+)$/.exec(id);
+  if (!token) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.from(token[1], "base64url").toString());
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const { v, q, k, s, j, t, p, a } = value as Record<string, unknown>;
+  if (v !== 1 || typeof q !== "string" || typeof k !== "string" || typeof s !== "string" ||
+      typeof j !== "string" || typeof t !== "string" || typeof p !== "string" || (a !== 0 && a !== 1)) return null;
+  if (q.length < 1 || q.length > 300 || k.length < 1 || k.length > 500) return null;
+  if (s.length > 500 || j.length > 500 || t.length > 200 || p.length > 2000) return null;
+  return {
+    query: q,
+    expires: Number.POSITIVE_INFINITY,
+    row: {
+      index: 0, sender: s, subject: j, preview: p, time: t, hasAttachments: a === 1,
+      fingerprint: JSON.stringify([k, s, j, t, p]),
+    },
+  };
+}
 
 function searchRegion(page: Page) {
   return page.getByRole("region", { name: /search results/i })
@@ -51,6 +107,8 @@ export interface OutlookOptions {
   reloadMs?: number;
   /** How long to wait for Outlook's search box after a navigation. */
   readyMs?: number;
+  /** How long temporary message IDs stay valid. Stable Outlook IDs ignore this. */
+  referenceTtlMs?: number;
   /** Opens a visible browser for interactive sign-in. */
   launchVisible?: (display: Record<string, string>) => Promise<BrowserContext>;
   /** Called when the sign-in state changes because of a mail operation. */
@@ -354,9 +412,13 @@ export class Outlook {
     }
   }
 
+  private resultList(page: Page) {
+    return searchRegion(page).locator(selectors.results).filter({ visible: true });
+  }
+
   private async rows(page: Page, query: string): Promise<Row[]> {
     const existing = this.lastSearchQuery === query && await this.showingSearch(page, query)
-      ? await this.extractRows(searchRegion(page).locator(selectors.results).filter({ visible: true }))
+      ? await this.extractRows(this.resultList(page))
       : [];
     if (existing.length) return existing;
     this.lastSearchQuery = undefined;
@@ -389,8 +451,7 @@ export class Outlook {
         await oldRow.dispose();
       }
     }
-    const region = searchRegion(page);
-    const candidates = region.locator(selectors.results).filter({ visible: true });
+    const candidates = this.resultList(page);
     const empty = page.getByText(/^(?:no results(?: found)?|we (?:couldn.t|didn.t) find anything)[.!]?$/i)
       .filter({ visible: true }).first();
     if (searchResponse && !await searchResponse) {
@@ -424,25 +485,68 @@ export class Outlook {
       const timeNode = node.querySelector("time");
       const time = timeNode?.getAttribute("datetime") ?? timeNode?.textContent?.trim() ?? node.querySelector(".qq2gS[title]")?.getAttribute("title") ?? "";
       const preview = text(s.preview);
-      const fingerprint = JSON.stringify([node.getAttribute("data-item-id") ?? node.getAttribute("data-convid"), sender, subject, time, preview]);
+      let key: string | null = null;
+      for (const name of s.keyAttributes) {
+        const own = node.getAttribute(name);
+        const nested = own || node.querySelector("[" + name + "]")?.getAttribute(name);
+        if (nested) { key = nested; break; }
+      }
+      const fingerprint = JSON.stringify([key, sender, subject, time, preview]);
       // Outlook's row label says "Has attachments" (or similar) for messages with files.
       const hasAttachments = /\battach/i.test(node.getAttribute("aria-label") ?? "");
       return [{ index, sender, subject, preview, time, fingerprint, hasAttachments }];
     }), selectors);
   }
 
+  // Outlook can list one message twice (top results and all results). Identical rows that carry an
+  // Outlook item key are the same message, so keep the first. Keyless look-alikes stay ambiguous.
+  private hitsFrom(rows: Row[]) {
+    return rows.filter((row, position) => {
+      const same = rows.filter(other => other.fingerprint === row.fingerprint);
+      return same.length === 1 || (hasKey(row) && same[0] === rows[position]);
+    });
+  }
+
+  /**
+   * Collect identifiable rows from the top of the result list until `limit` hits are available or
+   * Outlook stops rendering more. Virtualized lists only keep a window of rows in the DOM.
+   */
+  private async gatherRows(page: Page, query: string, limit: number) {
+    const seeded = await this.rows(page, query);
+    if (!seeded.length) return seeded;
+    const collected: Row[] = [];
+    const seen = new Set<string>();
+    const add = (list: Row[]) => {
+      // Keep every copy from this window so duplicate top/all-results rows still collapse later,
+      // but don't count the same row again after the next scroll.
+      const fresh = list.filter(row => !seen.has(row.fingerprint));
+      collected.push(...fresh);
+      for (const row of list) seen.add(row.fingerprint);
+    };
+    if (await this.scrollList(page, "top")) await page.waitForTimeout(250);
+    add(await this.extractRows(this.resultList(page)));
+    let stuck = 0;
+    for (let step = 0; step < 50 && this.hitsFrom(collected).length < limit; step++) {
+      const moved = await this.scrollList(page, "next");
+      if (!moved) break;
+      await page.waitForTimeout(250);
+      const before = collected.length;
+      add(await this.extractRows(this.resultList(page)));
+      if (collected.length === before) {
+        if (++stuck >= 3) break;
+      } else stuck = 0;
+    }
+    return collected;
+  }
+
   search(query: string, limit: number) {
     return this.run(async page => {
-      const rows = await this.rows(page, query);
-      // Outlook can list one message twice (top results and all results). Identical rows that carry an
-      // Outlook item key are the same message, so keep the first. Keyless look-alikes stay ambiguous.
-      const hits = rows.filter((row, position) => {
-        const same = rows.filter(other => other.fingerprint === row.fingerprint);
-        return same.length === 1 || (hasKey(row) && same[0] === rows[position]);
-      });
+      const rows = await this.gatherRows(page, query, limit);
+      const hits = this.hitsFrom(rows);
+      const ttl = this.options.referenceTtlMs ?? temporaryIdMs;
       const messages = hits.slice(0, limit).map(row => {
-        const message_id = randomUUID();
-        this.references.set(message_id, { query, row, expires: Date.now() + 30 * 60_000 });
+        const message_id = durableMessageId(query, row) ?? randomUUID();
+        this.references.set(message_id, { query, row, expires: Date.now() + ttl });
         return { message_id, sender: row.sender, subject: row.subject, received_at: row.time || null,
           has_attachments: row.hasAttachments, snippet: row.preview.slice(0, 300) };
       });
@@ -455,11 +559,12 @@ export class Outlook {
   }
 
   private reference(id: string) {
-    const reference = this.references.get(id);
-    if (!reference || reference.expires <= Date.now()) {
-      throw new MailError("UNKNOWN_MESSAGE", "Run search_mail again to get a fresh message ID.");
-    }
-    return reference;
+    const cached = this.references.get(id);
+    if (cached && cached.expires > Date.now()) return cached;
+    const durable = durableReference(id);
+    if (durable) return durable;
+    if (cached) this.references.delete(id);
+    throw new MailError("UNKNOWN_MESSAGE", "Run search_mail again to get a fresh message ID.");
   }
 
   /** Finds the search row for a message ID, verifies it and opens it in the reading pane. */
@@ -467,7 +572,7 @@ export class Outlook {
     if (reference.expires <= Date.now()) {
       throw new MailError("UNKNOWN_MESSAGE", "Run search_mail again to get a fresh message ID.");
     }
-    const visibleRows = () => searchRegion(page).locator(selectors.results).filter({ visible: true });
+    const visibleRows = () => this.resultList(page);
     const sameMessage = (row: Row) => {
       if (row.fingerprint === reference.row.fingerprint) return true;
       const [key] = JSON.parse(row.fingerprint);
@@ -507,31 +612,19 @@ export class Outlook {
     }
     const row = matches[0];
     const candidate = visibleRows().nth(row.index);
-    const snapshot = await candidate.evaluate((node, s) => {
-      const text = (selector: string) => node.querySelector(selector)?.textContent?.trim() ?? "";
-      const timeNode = node.querySelector("time");
-      return JSON.stringify([node.getAttribute("data-item-id") ?? node.getAttribute("data-convid"), text(s.sender), text(s.subject),
-        timeNode?.getAttribute("datetime") ?? timeNode?.textContent?.trim() ?? node.querySelector(".qq2gS[title]")?.getAttribute("title") ?? "", text(s.preview)]);
-    }, selectors);
-    if (snapshot !== row.fingerprint) {
+    const live = await this.extractRows(candidate);
+    if (live[0]?.fingerprint !== row.fingerprint) {
       console.error("outlook-mcp: search row changed between matching and opening.");
       throw new MailError("MESSAGE_CHANGED", "Search results changed before opening the message.");
     }
+    const wasUnread = await this.rowWasUnread(candidate);
     await candidate.locator(selectors.subject).first().click();
-    return row;
+    return { row, wasUnread };
   }
 
-  /**
-   * Outlook virtualizes the message list: only rows near the viewport exist in the page, and opening
-   * messages scrolls the list. Look at the rendered rows, then page through the list from the top.
-   */
-  private async scrollToFind(page: Page, find: (rows: Row[]) => Row[]) {
-    const visibleRows = () => searchRegion(page).locator(selectors.results).filter({ visible: true });
-    let matches = find(await this.extractRows(visibleRows()));
-    if (matches.length) return matches;
-    const region = searchRegion(page);
-    // Moves the list's scroll container: "top" resets it, "next" advances most of a screen. Returns false at the end.
-    const scroll = (step: "top" | "next") => region.evaluate((root, step) => {
+  // Moves the list's scroll container: "top" resets it, "next" advances most of a screen. Returns false at the end.
+  private scrollList(page: Page, step: "top" | "next") {
+    return searchRegion(page).evaluate((root, step) => {
       const scrollable = [root, ...root.querySelectorAll("*")].find(element =>
         element.scrollHeight > element.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(element).overflowY));
       if (!scrollable) return false;
@@ -539,15 +632,60 @@ export class Outlook {
       scrollable.scrollTop = step === "top" ? 0 : before + scrollable.clientHeight * 0.8;
       return step === "top" ? before !== 0 : scrollable.scrollTop !== before;
     }, step).catch(() => false);
-    let moved = await scroll("top");
+  }
+
+  /**
+   * Outlook virtualizes the message list: only rows near the viewport exist in the page, and opening
+   * messages scrolls the list. Look at the rendered rows, then page through the list from the top.
+   */
+  private async scrollToFind(page: Page, find: (rows: Row[]) => Row[]) {
+    const visibleRows = () => this.resultList(page);
+    let matches = find(await this.extractRows(visibleRows()));
+    if (matches.length) return matches;
+    let moved = await this.scrollList(page, "top");
     for (let steps = 0; steps < 25; steps++) {
       if (moved) await page.waitForTimeout(250);
       matches = find(await this.extractRows(visibleRows()));
       if (matches.length) return matches;
-      moved = await scroll("next");
+      moved = await this.scrollList(page, "next");
       if (!moved) break;
     }
     return matches;
+  }
+
+  // Unread is a status prefix or a dedicated badge, not a word that happens to appear in the subject.
+  private rowWasUnread(row: Locator) {
+    return row.evaluate(node => {
+      if (/^\s*unread\b/i.test(node.getAttribute("aria-label") ?? "")) return true;
+      return [...node.querySelectorAll("[aria-label]")].some(element =>
+        /^\s*unread\s*$/i.test(element.getAttribute("aria-label") ?? ""));
+    });
+  }
+
+  /**
+   * After a message that was unread is opened, click Outlook's own Mark as unread control when exactly
+   * one is visible outside the message body. Buttons inside the body are message content and are ignored.
+   */
+  private async restoreUnread(page: Page) {
+    const click = () => page.evaluate(() => {
+      const bodies = [...document.querySelectorAll('[id^="UniqueMessageBody"], [role="document"], [data-testid="message-body"]')];
+      const named = [...document.querySelectorAll("button, [role='button']")].filter(element => {
+        if (!(element instanceof HTMLElement) || element.hidden) return false;
+        if (bodies.some(body => body.contains(element))) return false;
+        const name = (element.getAttribute("aria-label") || element.innerText || "").replace(/\s+/g, " ").trim();
+        if (!/^mark as unread$/i.test(name)) return false;
+        const style = getComputedStyle(element);
+        return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
+      });
+      if (named.length !== 1 || !(named[0] instanceof HTMLElement)) return false;
+      named[0].click();
+      return true;
+    }).catch(() => false);
+    const started = Date.now();
+    while (Date.now() - started < 1000) {
+      if (await click()) return;
+      await page.waitForTimeout(100);
+    }
   }
 
   private pane(page: Page, row: Row) {
@@ -571,7 +709,14 @@ export class Outlook {
 
   async read(id: string) {
     const reference = this.reference(id);
-    return this.run(async page => this.extract(page, await this.openMessage(page, reference), id));
+    return this.run(async page => {
+      const opened = await this.openMessage(page, reference);
+      try {
+        return await this.extract(page, opened.row, id);
+      } finally {
+        if (opened.wasUnread) await this.restoreUnread(page);
+      }
+    });
   }
 
   /**
@@ -581,55 +726,60 @@ export class Outlook {
   async downloadAttachment(id: string, attachment: number | string, maxBytes: number) {
     const reference = this.reference(id);
     return this.run(async page => {
-      const row = await this.openMessage(page, reference);
-      const pane = this.pane(page, row);
-      await pane.locator(selectors.attachment).first().waitFor({ timeout: 8000 }).catch(() => {
-        throw new MailError("NO_ATTACHMENTS", "This message has no downloadable attachments.");
-      });
-      const names = await this.attachmentNames(pane);
-      let index: number;
-      if (typeof attachment === "number") {
-        index = attachment;
-      } else {
-        let found = names.flatMap((name, position) => name === attachment ? [position] : []);
-        if (!found.length) found = names.flatMap((name, position) => name.toLowerCase() === attachment.toLowerCase() ? [position] : []);
-        if (found.length > 1) throw new MailError("AMBIGUOUS_ATTACHMENT", "Several attachments share that name. Pass its index instead.");
-        index = found[0] ?? -1;
-      }
-      if (!(index >= 0 && index < names.length)) {
-        throw new MailError("UNKNOWN_ATTACHMENT", "No such attachment. Available: " + JSON.stringify(names));
-      }
-      const card = pane.locator(selectors.attachment).nth(index);
-      await card.hover().catch(() => {});
-      const menu = card.locator(selectors.attachmentMenu).first();
-      if (!await menu.count()) throw new MailError("ATTACHMENT_UNAVAILABLE", "Outlook offers no download for this attachment.");
-      await menu.click();
-      // Menu items carry icon glyphs in their text and often no aria-label, so match loosely but skip "Download all".
-      const items = page.locator('[role="menuitem"]:visible');
-      await items.first().waitFor({ timeout: 4000 }).catch(() => {});
-      const labels = await items.evaluateAll(nodes => nodes.map(node =>
-        ((node.getAttribute("aria-label") || node.textContent) ?? "").replace(/[^\p{L}\p{N} ]+/gu, " ").replace(/\s+/g, " ").trim()));
-      const position = labels.findIndex(label => /^download$/i.test(label)) >= 0
-        ? labels.findIndex(label => /^download$/i.test(label))
-        : labels.findIndex(label => /\bdownload\b/i.test(label) && !/\ball\b/i.test(label));
-      if (position < 0) {
-        console.error("outlook-mcp: attachment menu had no Download item: " + JSON.stringify(labels));
-        await page.keyboard.press("Escape").catch(() => {});
-        throw new MailError("ATTACHMENT_UNAVAILABLE", "Outlook offers no download for this attachment (it may be a cloud link).");
-      }
-      const item = items.nth(position);
-      const [download] = await Promise.all([page.waitForEvent("download", { timeout: 60_000 }), item.click()]);
+      const opened = await this.openMessage(page, reference);
+      const row = opened.row;
       try {
-        if (await download.failure()) throw new MailError("DOWNLOAD_FAILED", "Outlook could not download the attachment.");
-        const path = await download.path();
-        const { size } = await stat(path);
-        if (size > maxBytes) {
-          throw new MailError("ATTACHMENT_TOO_LARGE", "The attachment is " + Math.ceil(size / 1048576) + " MB, over the " +
-            Math.floor(maxBytes / 1048576) + " MB limit.");
+        const pane = this.pane(page, row);
+        await pane.locator(selectors.attachment).first().waitFor({ timeout: 8000 }).catch(() => {
+          throw new MailError("NO_ATTACHMENTS", "This message has no downloadable attachments.");
+        });
+        const names = await this.attachmentNames(pane);
+        let index: number;
+        if (typeof attachment === "number") {
+          index = attachment;
+        } else {
+          let found = names.flatMap((name, position) => name === attachment ? [position] : []);
+          if (!found.length) found = names.flatMap((name, position) => name.toLowerCase() === attachment.toLowerCase() ? [position] : []);
+          if (found.length > 1) throw new MailError("AMBIGUOUS_ATTACHMENT", "Several attachments share that name. Pass its index instead.");
+          index = found[0] ?? -1;
         }
-        return { message_id: id, name: names[index] || download.suggestedFilename(), size_bytes: size, data: await readFile(path) };
+        if (!(index >= 0 && index < names.length)) {
+          throw new MailError("UNKNOWN_ATTACHMENT", "No such attachment. Available: " + JSON.stringify(names));
+        }
+        const card = pane.locator(selectors.attachment).nth(index);
+        await card.hover().catch(() => {});
+        const menu = card.locator(selectors.attachmentMenu).first();
+        if (!await menu.count()) throw new MailError("ATTACHMENT_UNAVAILABLE", "Outlook offers no download for this attachment.");
+        await menu.click();
+        // Menu items carry icon glyphs in their text and often no aria-label, so match loosely but skip "Download all".
+        const items = page.locator('[role="menuitem"]:visible');
+        await items.first().waitFor({ timeout: 4000 }).catch(() => {});
+        const labels = await items.evaluateAll(nodes => nodes.map(node =>
+          ((node.getAttribute("aria-label") || node.textContent) ?? "").replace(/[^\p{L}\p{N} ]+/gu, " ").replace(/\s+/g, " ").trim()));
+        const position = labels.findIndex(label => /^download$/i.test(label)) >= 0
+          ? labels.findIndex(label => /^download$/i.test(label))
+          : labels.findIndex(label => /\bdownload\b/i.test(label) && !/\ball\b/i.test(label));
+        if (position < 0) {
+          console.error("outlook-mcp: attachment menu had no Download item: " + JSON.stringify(labels));
+          await page.keyboard.press("Escape").catch(() => {});
+          throw new MailError("ATTACHMENT_UNAVAILABLE", "Outlook offers no download for this attachment (it may be a cloud link).");
+        }
+        const item = items.nth(position);
+        const [download] = await Promise.all([page.waitForEvent("download", { timeout: 60_000 }), item.click()]);
+        try {
+          if (await download.failure()) throw new MailError("DOWNLOAD_FAILED", "Outlook could not download the attachment.");
+          const path = await download.path();
+          const { size } = await stat(path);
+          if (size > maxBytes) {
+            throw new MailError("ATTACHMENT_TOO_LARGE", "The attachment is " + Math.ceil(size / 1048576) + " MB, over the " +
+              Math.floor(maxBytes / 1048576) + " MB limit.");
+          }
+          return { message_id: id, name: names[index] || download.suggestedFilename(), size_bytes: size, data: await readFile(path) };
+        } finally {
+          await download.delete().catch(() => {});
+        }
       } finally {
-        await download.delete().catch(() => {});
+        if (opened.wasUnread) await this.restoreUnread(page);
       }
     });
   }

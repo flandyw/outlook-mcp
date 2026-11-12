@@ -1,6 +1,6 @@
 # Outlook Web MCP
 
-A read-only TypeScript MCP server with three tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and message IDs. Read returns available message metadata, Markdown and attachment names. Attachments are returned as the original file for the model to read. Search scrolls the on-screen result list and returns only rows the adapter can identify.
+A read-only TypeScript MCP server with four tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and message IDs. Read returns available message metadata, Markdown and attachment names. Attachments are returned as the original file for the model to read. Search scrolls the on-screen result list and returns only rows the adapter can identify. `mail_status` reports sign-in diagnostics and does not read mail.
 
 This is an unofficial browser adapter, with no Microsoft Graph API registration
 required. It is not affiliated with Microsoft. Opening a message can mark it as
@@ -26,6 +26,7 @@ exposed tools: there is no send, reply, delete, move, or general flag action.
 | `search_mail` | `query` (Outlook search syntax, e.g. `from:alice`, `subject:invoice`, `hasattachments:yes`), `limit` 1–40 | `message_id`, sender, subject, `received_at`, `has_attachments`, snippet for each identifiable result |
 | `read_mail` | `message_id` from `search_mail` | sender, `to`, `cc`, `received_at`, `attachment_names`, `body_markdown`, `truncated` |
 | `read_attachment` | `message_id`, `attachment` (index into `attachment_names` or exact file name) | Text metadata: `name`, `size_bytes`, `mime`, `kind: download`, `download_url`, `expires_at` |
+| `mail_status` | none | `auth`, `browser`, `busy`, `last_success_at`, `last_error`, and whether `OUTLOOK_PASSWORD_FILE` is configured and valid. `password_file_path` is included when configured. It does not read mail, sign in, or sign out. |
 
 Attachments are fetched with Outlook's own **Download** command, read into memory, deleted straight away and returned unchanged; the server does not convert or extract anything, so it is up to your MCP client and model to read PDFs or Office files. Files over 25 MB are refused (`OUTLOOK_ATTACHMENT_MAX_MB`); large files make large responses, so lower the limit if your client struggles. Set `OUTLOOK_ATTACHMENTS=0` to remove the tool. Cloud (OneDrive/SharePoint) links cannot be downloaded.
 
@@ -72,9 +73,9 @@ These commands talk to the running server through a private Unix socket (`$XDG_R
 | --- | --- |
 | `npm run login` | Opens a visible sign-in window on your desktop, even when the server runs as a service. Mail requests answer `AUTH_REQUIRED` until it finishes. Times out after 10 minutes. |
 | `npm run logout` | Closes the browser and deletes the browser profile, removing every saved Microsoft sign-in. |
-| `npm run status` | Shows sign-in state, whether the browser is running, and the last success or error. Add `-- --check` to load Outlook and test the session now. |
+| `npm run status` | Shows sign-in state, whether the browser is running, the last success or error, and whether the password file is valid. Exits with an error if `OUTLOOK_PASSWORD_FILE` is set but invalid. Add `-- --check` to load Outlook and test the session now. |
 
-When Microsoft ends the session, the server first tries to resume it without a secret: it picks the remembered account in the account picker and accepts "Stay signed in?". If Microsoft still wants a password or MFA, mail requests return `AUTH_REQUIRED`, the journal logs it, and a desktop notification asks you to run `npm run login` (`OUTLOOK_NOTIFY=0` turns notifications off). Login and logout are only available on the local socket, never on the MCP port, so a tailnet client cannot trigger them.
+When Microsoft ends the session, the server first tries to resume it without a secret: it picks the remembered account in the account picker and accepts "Stay signed in?". If Microsoft still wants a password or MFA, mail requests return `AUTH_REQUIRED`. The message, the journal line, and the desktop notification say which case it is: the password file is misconfigured, the Microsoft session expired and needs `npm run login`, a login window is already open, or another case such as a cooldown after a failed automatic attempt. `OUTLOOK_NOTIFY=0` turns notifications off. Login and logout are only available on the local socket, never on the MCP port, so a tailnet client cannot trigger them. `mail_status` reports the same sign-in facts over MCP and cannot sign in or sign out.
 
 Federated sign-in pages outside Microsoft (for example an organisation's ADFS) are blocked in headless mode. Add their origins to `OUTLOOK_SIGNIN_ORIGINS`, comma-separated.
 
@@ -91,9 +92,11 @@ OUTLOOK_USERNAME=your-microsoft-sign-in-address
 OUTLOOK_PASSWORD_FILE=/absolute/path/to/a/private/outlook-password
 ```
 
-Create the password file outside the project with permissions `0600` and put only the Microsoft password on its first line. This is a plaintext secret readable by your OS account. Use a private local location and exclude it from syncing and backups.
+Create the password file outside the project with mode `0600` and put only the Microsoft password on its first line. Owner-only modes such as `0400` are also accepted. Any group or world permission is rejected. This is a plaintext secret readable by your OS account. Use a private local location and exclude it from syncing and backups.
 
-When a mail request reaches a Microsoft password form that the account picker cannot skip, the worker tries signing in once and then resumes the request. If sign-in fails or Microsoft requires another step, the tool returns `AUTH_REQUIRED` and waits five minutes before retrying automatically; `npm run login` works at any time.
+When `OUTLOOK_PASSWORD_FILE` is set, the server checks it before listening and exits if it is invalid. `npm run status` and `npm run status -- --check` check it too. The file must exist, be a regular file, be readable, and be non-empty. A failure names the configured path and the problem (missing, not a regular file, unreadable, empty, or loose permissions). If the file is missing, the error also lists similarly named files in the same directory as hints. Nothing substitutes a different file, and the password itself is never printed.
+
+When a mail request reaches a Microsoft password form that the account picker cannot skip, the worker tries signing in once and then resumes the request. If the password file is misconfigured, the tool returns that error immediately instead of waiting. If sign-in fails or Microsoft requires another step, the tool returns `AUTH_REQUIRED` and waits five minutes before retrying automatically; `npm run login` works at any time.
 
 ## Access from another tailnet device
 
@@ -112,13 +115,13 @@ Use the reported HTTPS address with `/mcp` appended and the same bearer header. 
 npm test
 ```
 
-Tests use Playwright's Chromium, falling back to `/usr/bin/chromium` on Linux (override with `CHROMIUM_PATH`). The tests exercise Chromium fixtures (including expired sessions, the account picker, crashes, hangs, network loss and sign-in/sign-out), the authenticated MCP handshake and the control socket. The fixture does not validate selectors against your signed-in Outlook layout. After sign-in, search for a known unread email, call `read_mail` with its returned ID, and verify its subject, body and unread state in Outlook.
+Tests use Playwright's Chromium, falling back to `/usr/bin/chromium` on Linux (override with `CHROMIUM_PATH`). The tests exercise Chromium fixtures (including expired sessions, the account picker, automatic sign-in, crashes, hangs, network loss and sign-in/sign-out), password-file checks, the authenticated MCP handshake, `mail_status`, and the control socket. The fixture does not validate selectors against your signed-in Outlook layout. After sign-in, search for a known unread email, call `read_mail` with its returned ID, and verify its subject, body and unread state in Outlook.
 
 Temporary search result IDs expire after 30 minutes or on server restart. Stable `ow1.` IDs do not. Error codes:
 
 - `UNKNOWN_MESSAGE`: the ID is unknown, malformed, or a temporary ID that expired. Search again.
 - `MESSAGE_CHANGED`: the result moved or no longer matches one row. Search again.
-- `AUTH_REQUIRED`: the browser needs a fresh sign-in (`npm run login`), or a sign-in window is open.
+- `AUTH_REQUIRED`: sign-in is required. The message says which: the password file is misconfigured (path and reason, plus similar filenames when it is missing), the Microsoft session expired (`npm run login`), a login window is already open, or another case such as a cooldown after automatic sign-in failed.
 - `SIGNED_OUT`: `npm run logout` is running.
 - `NETWORK_ERROR`: Outlook could not be reached.
 - `TIMEOUT`: Outlook was slow. If one request runs longer than 90 seconds, the browser is reset. Retry.

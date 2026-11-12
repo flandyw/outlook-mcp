@@ -1,6 +1,7 @@
 import { displayVariables, profileDir } from "./browser.js";
 import { callControl, controlSocketPath, ServerNotRunning } from "./control.js";
 import { MailError, Outlook } from "./outlook.js";
+import { inspectPasswordFile, type PasswordFileReport } from "./reauth.js";
 
 const command = process.argv[2];
 const display = Object.fromEntries(displayVariables.flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []));
@@ -10,13 +11,19 @@ function fail(message: string): never {
   process.exit(1);
 }
 
+function errorText(error: unknown) {
+  if (!(error instanceof Error)) return String(error);
+  const code = "code" in error && typeof error.code === "string" ? error.code + ": " : "";
+  return code + error.message;
+}
+
 // Talks to the running server when there is one, so the profile is never opened twice.
 async function viaServer<T>(method: "GET" | "POST", path: string, body?: unknown) {
   try {
     return await callControl<T>(method, path, body);
   } catch (error) {
     if (error instanceof ServerNotRunning) return undefined;
-    fail("Server error: " + (error instanceof Error ? error.message : error));
+    fail("Server error: " + errorText(error));
   }
 }
 
@@ -27,6 +34,20 @@ function describe(status: Record<string, unknown>) {
   if (status.last_success_at) console.log("Last OK:  " + status.last_success_at);
   const error = status.last_error as { code: string; message: string; at: string } | null;
   if (error) console.log("Last err: " + error.code + " at " + error.at + " — " + error.message);
+}
+
+function passwordReportOf(status: Record<string, unknown>): PasswordFileReport {
+  const value = status.password_file;
+  if (value && typeof value === "object" && "configured" in value && "valid" in value) return value as PasswordFileReport;
+  return inspectPasswordFile();
+}
+
+function printPassword(report: PasswordFileReport) {
+  if (!report.configured || !report.path) {
+    console.log("Password: not configured");
+    return;
+  }
+  console.log("Password: " + (report.valid ? "valid" : "invalid") + " (" + report.path + ")");
 }
 
 async function login() {
@@ -60,13 +81,16 @@ async function logout() {
 async function status() {
   const check = process.argv.includes("--check");
   const remote = await viaServer<Record<string, unknown>>(check ? "POST" : "GET", check ? "/check" : "/status");
+  const report = remote ? passwordReportOf(remote) : inspectPasswordFile();
   if (!remote) {
     console.log("Server:   not running (control socket " + controlSocketPath() + ")");
     console.log("Profile:  " + profileDir());
-    return;
+  } else {
+    console.log("Server:   running");
+    describe(remote);
   }
-  console.log("Server:   running");
-  describe(remote);
+  printPassword(report);
+  if (report.configured && !report.valid) fail(report.message ?? "Password file misconfigured.");
 }
 
 const commands: Record<string, () => Promise<void>> = { login, logout, status };

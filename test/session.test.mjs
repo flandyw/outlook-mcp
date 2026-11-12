@@ -1,10 +1,32 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, readdir } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readdir, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { launchChromium } from "./chromium.mjs";
 import { Outlook } from "../dist/outlook.js";
+
+// Tests that change sign-in settings share one queue so they do not clobber each other's environment.
+let envQueue = Promise.resolve();
+function withEnv(updates, body) {
+  const run = envQueue.then(async () => {
+    const saved = new Map(Object.keys(updates).map(key => [key, process.env[key]]));
+    for (const [key, value] of Object.entries(updates)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    try {
+      await body();
+    } finally {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+  envQueue = run.then(() => {}, () => {});
+  return run;
+}
 
 const mailboxPage = `<input id="topSearchInput" aria-label="Search">
   <div id="MailList"><div role="listbox"></div></div>
@@ -36,15 +58,33 @@ test("reports an expired session and notifies once", async t => {
   const launcher = await harness(t, route => route.request().url().startsWith("https://outlook.office.com/")
     ? route.fulfill(redirect("https://login.microsoftonline.com/common/oauth2/authorize"))
     : route.fulfill({ contentType: "text/html", body: '<p>Enter password</p><input type="password" name="passwd"><input type="submit" id="idSIButton9">' }));
-  const changes = [];
-  const outlook = new Outlook(launcher, { onAuthChange: state => changes.push(state), readyMs: 1000 });
-  delete process.env.OUTLOOK_PASSWORD_FILE;
-  await assert.rejects(outlook.search("x", 5), { code: "AUTH_REQUIRED" });
-  await assert.rejects(outlook.search("x", 5), { code: "AUTH_REQUIRED" });
-  assert.deepEqual(changes, ["signed_out"]);
-  assert.equal(outlook.status().auth, "signed_out");
-  assert.equal(outlook.status().last_error.code, "AUTH_REQUIRED");
-  await outlook.close();
+  await withEnv({ OUTLOOK_PASSWORD_FILE: undefined, OUTLOOK_USERNAME: undefined }, async () => {
+    const changes = [];
+    const noted = [];
+    const outlook = new Outlook(launcher, {
+      onAuthChange: (state, detail) => {
+        changes.push(state);
+        if (detail?.message) noted.push(detail.message);
+      },
+      readyMs: 1000,
+    });
+    const expectExpired = error => {
+      assert.equal(error.code, "AUTH_REQUIRED");
+      assert.match(error.message, /Microsoft session expired/);
+      assert.match(error.message, /npm run login/);
+      assert.doesNotMatch(error.message, /Password file/);
+      assert.doesNotMatch(error.message, /login window is already open/);
+      return true;
+    };
+    await assert.rejects(outlook.search("x", 5), expectExpired);
+    await assert.rejects(outlook.search("x", 5), expectExpired);
+    assert.deepEqual(changes, ["signed_out"]);
+    assert.match(noted[0], /Microsoft session expired/);
+    assert.equal(outlook.status().auth, "signed_out");
+    assert.equal(outlook.status().last_error.code, "AUTH_REQUIRED");
+    assert.match(outlook.status().last_error.message, /Microsoft session expired/);
+    await outlook.close();
+  });
 });
 
 test("resumes single sign-on through the account picker and stay-signed-in prompt", async t => {
@@ -104,7 +144,7 @@ test("interactive sign-in blocks mail requests and finishes when Outlook loads",
   const outlook = new Outlook(visible, { launchVisible: visible });
   const pending = outlook.signIn({ display: { WAYLAND_DISPLAY: "wayland-test" } });
   await new Promise(resolve => setTimeout(resolve, 100));
-  await assert.rejects(outlook.search("x", 5), { code: "AUTH_REQUIRED", message: /in progress/ });
+  await assert.rejects(outlook.search("x", 5), { code: "AUTH_REQUIRED", message: /login window is already open/ });
   await assert.rejects(outlook.signIn(), { code: "BUSY" });
   assert.equal(await pending, "signed_in");
   assert.equal(outlook.status().auth, "signed_in");
@@ -145,4 +185,78 @@ test("logout deletes only a browser profile", async t => {
   process.env.OUTLOOK_PROFILE = dir;
   await assert.rejects(outlook.logout(), { code: "UNSAFE_PROFILE" });
   assert.deepEqual(await readdir(dir), ["notes.txt"]);
+});
+
+test("names a misconfigured password file instead of a vague sign-in failure", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "outlook-password-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const configured = join(dir, "alpha-token-value");
+  const hint = join(dir, "alpha-token-value-bak");
+  const canary = "session-canary-do-not-print";
+  await writeFile(hint, canary + "\n", { mode: 0o600 });
+  await chmod(hint, 0o600);
+  const launcher = await harness(t, route => route.request().url().startsWith("https://outlook.office.com/")
+    ? route.fulfill(redirect("https://login.microsoftonline.com/common/oauth2/authorize"))
+    : route.fulfill({ contentType: "text/html", body: '<p>fixture@example.com</p><input type="password" name="passwd"><input type="submit" id="idSIButton9">' }));
+  await withEnv({ OUTLOOK_USERNAME: "fixture@example.com", OUTLOOK_PASSWORD_FILE: configured }, async () => {
+    const noted = [];
+    const outlook = new Outlook(launcher, {
+      onAuthChange: (_state, detail) => { if (detail?.message) noted.push(detail.message); },
+      readyMs: 1000,
+    });
+    const expectFile = error => {
+      assert.equal(error.code, "AUTH_REQUIRED");
+      assert.match(error.message, /Password file misconfigured/);
+      assert.match(error.message, /is missing/);
+      assert.equal(error.message.includes(hint), true);
+      assert.match(error.message, /not used automatically/);
+      assert.doesNotMatch(error.message, /Automatic sign-in failed/);
+      assert.doesNotMatch(error.message, /cooling down/);
+      assert.equal(error.message.includes(canary), false);
+      return true;
+    };
+    await assert.rejects(outlook.search("x", 5), expectFile);
+    await assert.rejects(outlook.search("x", 5), expectFile);
+    assert.equal(noted.length, 1);
+    assert.match(noted[0], /Password file misconfigured/);
+    assert.equal(noted[0].includes(canary), false);
+    await outlook.close();
+  });
+});
+
+test("distinguishes a failed automatic sign-in from the cooldown that follows", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "outlook-password-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, "password");
+  const password = "fixture-password";
+  await writeFile(file, password + "\n", { mode: 0o600 });
+  await chmod(file, 0o600);
+  const launcher = await harness(t, route => {
+    if (route.request().url().startsWith("https://outlook.office.com/")) {
+      return route.fulfill(redirect("https://login.microsoftonline.com/common/oauth2/authorize"));
+    }
+    return route.fulfill({ contentType: "text/html", body: `<form><p>fixture@example.com</p>
+      <input type="password" name="passwd"><input type="submit" id="idSIButton9"></form>
+      <script>document.forms[0].onsubmit = (event) => { event.preventDefault(); location.href = "about:blank"; };</script>` });
+  });
+  await withEnv({ OUTLOOK_USERNAME: "fixture@example.com", OUTLOOK_PASSWORD_FILE: file }, async () => {
+    const outlook = new Outlook(launcher, { readyMs: 1000 });
+    await assert.rejects(outlook.search("x", 5), error => {
+      assert.equal(error.code, "AUTH_REQUIRED");
+      assert.match(error.message, /Automatic sign-in failed/);
+      assert.match(error.message, /npm run login/);
+      assert.doesNotMatch(error.message, /Password file misconfigured/);
+      assert.equal(error.message.includes(password), false);
+      return true;
+    });
+    await assert.rejects(outlook.search("x", 5), error => {
+      assert.equal(error.code, "AUTH_REQUIRED");
+      assert.match(error.message, /cooling down/);
+      assert.match(error.message, /npm run login/);
+      assert.doesNotMatch(error.message, /Password file misconfigured/);
+      assert.equal(error.message.includes(password), false);
+      return true;
+    });
+    await outlook.close();
+  });
 });

@@ -26,7 +26,7 @@ exposed tools: there is no send, reply, delete, move, or general flag action.
 | `search_mail` | `query` (Outlook search syntax, e.g. `from:alice`, `subject:invoice`, `hasattachments:yes`), `limit` 1–40 | `message_id`, sender, subject, `received_at`, `has_attachments`, snippet for each identifiable result |
 | `read_mail` | `message_id` from `search_mail` | sender, `to`, `cc`, `received_at`, `attachment_names`, `body_markdown`, `truncated` |
 | `read_attachment` | `message_id`, `attachment` (index into `attachment_names` or exact file name) | Text metadata: `name`, `size_bytes`, `mime`, `kind: download`, `download_url`, `expires_at` |
-| `mail_status` | none | `auth`, `browser`, `busy`, `last_success_at`, `last_error`, and whether `OUTLOOK_PASSWORD_FILE` is configured and valid. `password_file_path` is included when configured. It does not read mail, sign in, or sign out. |
+| `mail_status` | none | `auth`, `browser`, `busy`, `last_success_at`, `last_error`, the automatic sign-in username and password source (`env`, `file` or `none`; never the password), and whether `OUTLOOK_PASSWORD_FILE` is configured and valid. `password_file_path` is included when configured. It does not read mail, sign in, or sign out. |
 | `search_events` | `start` and `end` (`YYYY-MM-DD`, end inclusive, at most 14 days), optional `query`, `limit` 1–25 | `event_id`, title, `start`, `end`, `all_day`, location and `date` for each rendered event |
 | `read_event` | `event_id` from `search_events` | times, location, attendees, recurrence, `body_markdown`, `truncated` |
 
@@ -53,7 +53,7 @@ printf 'MCP_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
 npm run login
 ```
 
-`npm run login` opens a sign-in window. Complete Microsoft sign-in and MFA and choose **Stay signed in** when asked: that persistent sign-in is what lets the server run headless afterwards. The window closes by itself once Outlook loads. For Outlook.com, put `OUTLOOK_URL=https://outlook.live.com/mail/` in `.env` (the default is `https://outlook.office.com/mail/`).
+`npm run login` first attempts unattended sign-in when `OUTLOOK_USERNAME`, `OUTLOOK_PASSWORD` or `OUTLOOK_PASSWORD_FILE` is configured in `.env`. It uses the existing session or the configured password and exits with an error if Microsoft needs MFA or another manual step. Use `npm run login -- --interactive` to open a sign-in window, or `npm run login -- --non-interactive` to check an existing session without a desktop. With no credentials configured, `npm run login` opens a sign-in window. Complete Microsoft sign-in and MFA and choose **Stay signed in** when asked: that persistent sign-in is what lets the server run headless afterwards. The window closes by itself once Outlook loads. For Outlook.com, put `OUTLOOK_URL=https://outlook.live.com/mail/` in `.env` (the default is `https://outlook.office.com/mail/`).
 
 Opening a message can mark it as read. Afterwards the adapter clicks a visible **Mark as unread** button outside the message body when the row was labeled unread. That click does not change Outlook’s settings, and it does nothing when the button is absent, so disable automatic marking as read where available and verify with an unread test message before using the server on real mail. Use a dedicated profile: logout deletes its directory. The profile lives in `~/.local/state/outlook-mcp/chromium` (`OUTLOOK_PROFILE`). Keep it private.
 
@@ -77,7 +77,7 @@ These commands talk to the running server through a private Unix socket (`$XDG_R
 
 | Command | What it does |
 | --- | --- |
-| `npm run login` | Opens a visible sign-in window on your desktop, even when the server runs as a service. Mail requests answer `AUTH_REQUIRED` until it finishes. Times out after 10 minutes. |
+| `npm run login` | Attempts unattended sign-in with configured credentials; `-- --interactive` opens a visible sign-in window, even when the server runs as a service. Mail requests answer `AUTH_REQUIRED` until it finishes. Times out after 10 minutes. |
 | `npm run logout` | Closes the browser and deletes the browser profile, removing every saved Microsoft sign-in. |
 | `npm run status` | Shows sign-in state, whether the browser is running, the last success or error, and whether the password file is valid. Exits with an error if `OUTLOOK_PASSWORD_FILE` is set but invalid. Add `-- --check` to load Outlook and test the session now. |
 
@@ -91,18 +91,27 @@ If Microsoft will not keep you signed in between browser restarts, set `OUTLOOK_
 
 ## Automatically sign back in
 
-For accounts that use a password without MFA, add these two settings to `.env` and restart the server.
+For accounts that use a password without MFA, put the credentials in `.env` (keep it mode `0600`) and restart the server:
 
 ```dotenv
 OUTLOOK_USERNAME=your-microsoft-sign-in-address
-OUTLOOK_PASSWORD_FILE=/absolute/path/to/a/private/outlook-password
+OUTLOOK_PASSWORD=your-microsoft-password
 ```
 
-Create the password file outside the project with mode `0600` and put only the Microsoft password on its first line. Owner-only modes such as `0400` are also accepted. Any group or world permission is rejected. This is a plaintext secret readable by your OS account. Use a private local location and exclude it from syncing and backups.
+To keep the password out of `.env`, set `OUTLOOK_PASSWORD_FILE=/absolute/path/to/a/private/outlook-password` instead. Use one or the other: setting both stops the server at startup. The file must have mode `0600` (owner-only modes such as `0400` are fine) and hold only the password on its first line. Group or world permissions are rejected. Either way the password is plaintext readable by your OS account, so keep it out of syncing and backups. Chromium and `notify-send` are started without `OUTLOOK_PASSWORD` or `MCP_TOKEN` in their environment, and the password is never logged or returned by `mail_status`.
 
-When `OUTLOOK_PASSWORD_FILE` is set, the server checks it before listening and exits if it is invalid. `npm run status` and `npm run status -- --check` check it too. The file must exist, be a regular file, be readable, and be non-empty. A failure names the configured path and the problem (missing, not a regular file, unreadable, empty, or loose permissions). If the file is missing, the error also lists similarly named files in the same directory as hints. Nothing substitutes a different file, and the password itself is never printed.
+When `OUTLOOK_PASSWORD_FILE` is set, the server checks it before listening and exits if it is invalid. `npm run status` and `npm run status -- --check` check it too. A failure names the configured path and the problem (missing, not a regular file, unreadable, empty, or loose permissions). A missing file also lists similarly named files in the same directory as hints, but nothing substitutes a different file.
 
-When a mail request reaches a Microsoft password form that the account picker cannot skip, the worker tries signing in once and then resumes the request. If the password file is misconfigured, the tool returns that error immediately instead of waiting. If sign-in fails or Microsoft requires another step, the tool returns `AUTH_REQUIRED` and waits five minutes before retrying automatically; `npm run login` works at any time.
+How the server handles a sign-out:
+
+- Outlook often loads on its own origin and redirects to Microsoft sign-in a second or two later. The server keeps watching for that redirect instead of giving up.
+- It first resumes without a secret: it picks the remembered account, accepts **Stay signed in?** (ticking "Don't show this again") and clicks **Ask later** or **Skip for now** on optional security prompts. Only then does it type the configured username and password.
+- When Outlook shows its own "session expired" prompt, the server reloads the mailbox to start the Microsoft sign-in flow.
+- When the session ends during a request, including in the calendar tab, the server signs back in once and repeats the request before reporting `AUTH_REQUIRED`.
+- When Microsoft rejects the password or username, or reports the account as locked, automatic sign-in pauses for 6 hours so repeated attempts cannot lock the account. When MFA or another verification step is required, it pauses for 15 minutes. Any other failure retries after 2 minutes. `npm run login` clears the pause at any time.
+- Automatic recoveries are logged to the journal (`signed back in automatically…`). A desktop notification appears only when a person needs to act.
+
+With credentials configured, `npm run login` attempts this unattended sign-in. Use `npm run login -- --interactive` for MFA.
 
 ## Access from another tailnet device
 
@@ -132,7 +141,7 @@ Temporary search result IDs expire after 30 minutes or on server restart. Stable
 - `INVALID_RANGE`: the dates, query or limit cannot be used. Ranges are real `YYYY-MM-DD` dates of at most 14 days.
 - `SIGNED_OUT`: `npm run logout` is running.
 - `NETWORK_ERROR`: Outlook could not be reached.
-- `TIMEOUT`: Outlook was slow. If one request runs longer than 90 seconds, the browser is reset. Retry.
+- `TIMEOUT`: Outlook was slow. If one request runs longer than 3 minutes, the browser is reset. Retry.
 - `BROWSER_RESTARTED`: the browser crashed or its window closed. The next request starts a new one.
 - `PROFILE_LOCKED`: another browser (an old `npm start`, or a direct `npm run login`) is using the profile.
 - `UI_CHANGED`: the adapter could not identify a search region, row or reading pane. Outlook error pages get one automatic reload first.

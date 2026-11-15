@@ -139,6 +139,14 @@ test("recovers from a closed browser, resets a hung one and closes when idle", a
   await outlook.close();
 });
 
+test("unattended sign-in verifies the mailbox without opening a sign-in window", async t => {
+  const launcher = await harness(t, route => route.fulfill({ contentType: "text/html", body: mailboxPage }));
+  const outlook = new Outlook(launcher, { launchVisible: () => { throw new Error("Unexpected visible browser"); } });
+  t.after(() => outlook.close());
+  assert.equal(await outlook.signInNonInteractive(), "signed_in");
+  assert.equal(outlook.status().auth, "signed_in");
+});
+
 test("interactive sign-in blocks mail requests and finishes when Outlook loads", async t => {
   const visible = await harness(t, route => route.fulfill({ contentType: "text/html", body: mailboxPage }));
   const outlook = new Outlook(visible, { launchVisible: visible });
@@ -258,5 +266,100 @@ test("distinguishes a failed automatic sign-in from the cooldown that follows", 
       return true;
     });
     await outlook.close();
+  });
+});
+
+// Microsoft's password page: accepts "fixture-password" for fixture@example.com, otherwise shows the classic error.
+const passwordPage = `<form><p>fixture@example.com</p><div id="passwordError" hidden>Your account or password is incorrect.</div>
+  <input type="password" name="passwd"><input type="submit" id="idSIButton9"></form>
+  <script>document.forms[0].onsubmit = event => {
+    event.preventDefault();
+    if (document.querySelector('[name=passwd]').value === 'fixture-password') location.href = '/kmsi';
+    else document.getElementById('passwordError').hidden = false;
+  };</script>`;
+const kmsiPage = `<div>Stay signed in?</div><input type="checkbox" id="KmsiCheckboxField">
+  <input type="submit" id="idSIButton9" value="Yes" onclick="location.href='https://outlook.office.com/mail/?signedin'">`;
+
+function signInHarness(t, state) {
+  return harness(t, route => {
+    const url = new URL(route.request().url());
+    if (url.hostname === "login.microsoftonline.com") {
+      state.loginLoads = (state.loginLoads ?? 0) + 1;
+      if (url.pathname === "/kmsi") { state.signedIn = true; return route.fulfill({ contentType: "text/html", body: kmsiPage }); }
+      return route.fulfill({ contentType: "text/html", body: passwordPage });
+    }
+    if (url.pathname.startsWith("/searchservice")) {
+      // A session that ends during the search sends the page to sign-in.
+      return route.fulfill(state.signedIn ? { body: "{}" } : { contentType: "text/html", body: "{}" });
+    }
+    if (state.signedIn) return route.fulfill({ contentType: "text/html", body: mailboxPage });
+    // Outlook loads on its own origin first and redirects to sign-in after a delay.
+    return route.fulfill({ contentType: "text/html", body: `<p>Loading…</p>
+      <script>setTimeout(() => location.replace("https://login.microsoftonline.com/common/oauth2/authorize"), ${state.delay ?? 0});</script>` });
+  });
+}
+
+test("signs back in with OUTLOOK_PASSWORD after a delayed redirect to Microsoft sign-in", async t => {
+  const state = { delay: 1500 };
+  const launcher = await signInHarness(t, state);
+  await withEnv({ OUTLOOK_USERNAME: "fixture@example.com", OUTLOOK_PASSWORD: "fixture-password", OUTLOOK_PASSWORD_FILE: undefined }, async () => {
+    const changes = [];
+    const outlook = new Outlook(launcher, { onAuthChange: state => changes.push(state), readyMs: 4000 });
+    t.after(() => outlook.close());
+    assert.deepEqual((await outlook.search("nothing", 5)).messages, []);
+    assert.equal(state.signedIn, true);
+    assert.deepEqual(changes, ["signed_in"]);
+    assert.equal(outlook.status().credentials.password_source, "env");
+    assert.equal(JSON.stringify(outlook.status()).includes("fixture-password"), false);
+  });
+});
+
+test("recovers once when the session ends in the middle of a request", async t => {
+  const state = { signedIn: true };
+  const launcher = await signInHarness(t, state);
+  await withEnv({ OUTLOOK_USERNAME: "fixture@example.com", OUTLOOK_PASSWORD: "fixture-password", OUTLOOK_PASSWORD_FILE: undefined }, async () => {
+    const outlook = new Outlook(launcher, { readyMs: 3000 });
+    t.after(() => outlook.close());
+    await outlook.check();
+    // Microsoft ends the session; the open page still shows Outlook until the next navigation.
+    state.signedIn = false;
+    const page = launcher.contexts[0].pages()[0];
+    await page.evaluate(() => {
+      document.querySelector("input").addEventListener("keydown", event => {
+        if (event.key === "Enter") location.href = "https://login.microsoftonline.com/common/oauth2/authorize";
+      }, { capture: true });
+    });
+    assert.deepEqual((await outlook.search("nothing", 5)).messages, []);
+    assert.equal(state.signedIn, true);
+    assert.equal(outlook.status().auth, "signed_in");
+  });
+});
+
+test("stops retrying when Microsoft rejects the configured password", async t => {
+  const state = {};
+  const launcher = await signInHarness(t, state);
+  await withEnv({ OUTLOOK_USERNAME: "fixture@example.com", OUTLOOK_PASSWORD: "wrong-password", OUTLOOK_PASSWORD_FILE: undefined }, async () => {
+    const outlook = new Outlook(launcher, { readyMs: 3000 });
+    t.after(() => outlook.close());
+    const rejected = error => {
+      assert.equal(error.code, "AUTH_REQUIRED");
+      assert.match(error.message, /rejected the configured password/);
+      assert.equal(error.message.includes("wrong-password"), false);
+      return true;
+    };
+    await assert.rejects(outlook.search("x", 5), rejected);
+    const loads = state.loginLoads;
+    await assert.rejects(outlook.search("x", 5), error => rejected(error) && /paused/.test(error.message));
+    assert.equal(state.signedIn, undefined);
+    assert.ok(state.loginLoads - loads <= 1, "the password is not typed again while paused");
+  });
+});
+
+test("refuses both OUTLOOK_PASSWORD and OUTLOOK_PASSWORD_FILE", async t => {
+  const launcher = await signInHarness(t, {});
+  await withEnv({ OUTLOOK_USERNAME: "fixture@example.com", OUTLOOK_PASSWORD: "fixture-password", OUTLOOK_PASSWORD_FILE: "/nonexistent" }, async () => {
+    const outlook = new Outlook(launcher, { readyMs: 3000 });
+    t.after(() => outlook.close());
+    await assert.rejects(outlook.check(), { code: "AUTH_REQUIRED", message: /only one of OUTLOOK_PASSWORD and OUTLOOK_PASSWORD_FILE/ });
   });
 });

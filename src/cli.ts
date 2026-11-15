@@ -1,7 +1,7 @@
 import { displayVariables, profileDir } from "./browser.js";
 import { callControl, controlSocketPath, ServerNotRunning } from "./control.js";
 import { MailError, Outlook } from "./outlook.js";
-import { inspectPasswordFile, type PasswordFileReport } from "./reauth.js";
+import { credentialsSummary, inspectPasswordFile, type PasswordFileReport } from "./reauth.js";
 
 const command = process.argv[2];
 const display = Object.fromEntries(displayVariables.flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []));
@@ -43,6 +43,12 @@ function passwordReportOf(status: Record<string, unknown>): PasswordFileReport {
 }
 
 function printPassword(report: PasswordFileReport) {
+  const { password_source: source } = credentialsSummary();
+  if (source === "conflict") fail("Password: both OUTLOOK_PASSWORD and OUTLOOK_PASSWORD_FILE are set; keep only one.");
+  if (source === "env") {
+    console.log("Password: OUTLOOK_PASSWORD in .env" + (process.env.OUTLOOK_USERNAME ? "" : " (OUTLOOK_USERNAME missing, so automatic sign-in is off)"));
+    return;
+  }
   if (!report.configured || !report.path) {
     console.log("Password: not configured");
     return;
@@ -51,16 +57,22 @@ function printPassword(report: PasswordFileReport) {
 }
 
 async function login() {
-  if (!display.DISPLAY && !display.WAYLAND_DISPLAY) fail("Run npm run login from a graphical session so the sign-in window can open.");
-  console.log("Opening a sign-in window. Complete Microsoft sign-in and MFA, and choose \"Stay signed in\" if asked.");
-  console.log("The window closes by itself once Outlook loads.");
-  const remote = await viaServer<{ result: string }>("POST", "/login", { display });
+  const nonInteractive = !process.argv.includes("--interactive")
+    && (!!process.env.OUTLOOK_USERNAME || !!process.env.OUTLOOK_PASSWORD || !!process.env.OUTLOOK_PASSWORD_FILE || process.argv.includes("--non-interactive"));
+  if (!nonInteractive && !display.DISPLAY && !display.WAYLAND_DISPLAY) fail("Run npm run login from a graphical session, or set OUTLOOK_USERNAME and OUTLOOK_PASSWORD in .env for unattended sign-in.");
+  console.log(nonInteractive
+    ? "Attempting unattended sign-in using the configured credentials."
+    : "Opening a sign-in window. Complete Microsoft sign-in and MFA. The window closes once Outlook loads.");
+  const remote = await viaServer<{ result: string }>("POST", "/login", { display, nonInteractive });
   let result = remote?.result;
   if (!remote) {
+    const outlook = new Outlook();
     try {
-      result = await new Outlook().signIn({ display });
+      result = nonInteractive ? await outlook.signInNonInteractive() : await outlook.signIn({ display });
     } catch (error) {
-      fail(error instanceof MailError ? error.message : String(error));
+      throw error;
+    } finally {
+      await outlook.close();
     }
   }
   if (result === "signed_in") console.log("Signed in" + (remote ? ". The running server will use the new session." : "."));

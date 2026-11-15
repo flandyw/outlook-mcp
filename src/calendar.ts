@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { BrowserContext, Page } from "playwright";
 import { mailbox, outlookOrigins, safeOrigin, signInOrigins } from "./browser.js";
 import { formatBody, type BodyPart } from "./format.js";
-import { MailError, type Outlook } from "./outlook.js";
+import { MailError, SessionLostError, type Outlook } from "./outlook.js";
 import { isMicrosoftLogin } from "./reauth.js";
 
 const signInHelp = "Run npm run login on the server host to sign in again.";
@@ -238,7 +238,8 @@ export class Calendar {
   }
 
   private authRequired(): never {
-    throw new MailError("AUTH_REQUIRED", "Microsoft needs you to sign in again. " + signInHelp);
+    // The worker signs back in once and repeats the calendar request before reporting this.
+    throw new SessionLostError("Microsoft needs you to sign in again. " + signInHelp);
   }
 
   private async waitForCalendar(page: Page) {

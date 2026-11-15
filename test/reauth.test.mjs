@@ -197,3 +197,20 @@ test("does not block when the password path is a fifo", t => {
   assert.equal(result.error, undefined, result.stderr || result.error?.message);
   assert.equal(result.status, 0, result.stderr);
 });
+
+test("keeps secrets out of child process environments", async () => {
+  const { childEnv } = await import("../dist/browser.js");
+  const saved = { token: process.env.MCP_TOKEN, password: process.env.OUTLOOK_PASSWORD };
+  process.env.MCP_TOKEN = "x".repeat(40);
+  process.env.OUTLOOK_PASSWORD = canary;
+  try {
+    const env = childEnv({ DISPLAY: ":9" });
+    assert.equal(env.DISPLAY, ":9");
+    assert.equal("MCP_TOKEN" in env, false);
+    assert.equal("OUTLOOK_PASSWORD" in env, false);
+  } finally {
+    for (const [key, value] of [["MCP_TOKEN", saved.token], ["OUTLOOK_PASSWORD", saved.password]]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});

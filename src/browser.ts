@@ -37,6 +37,17 @@ export class ProfileLockedError extends Error {
 // Variables a visible sign-in window needs from the desktop session that asked for it.
 export const displayVariables = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] as const;
 
+// Secrets the server reads from .env. Child processes (Chromium, notify-send) never inherit them.
+const secretVariables = new Set(["MCP_TOKEN", "OUTLOOK_PASSWORD"]);
+
+export function childEnv(extra: Partial<Record<string, string>> = {}) {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries({ ...process.env, ...extra })) {
+    if (value !== undefined && !secretVariables.has(key)) env[key] = value;
+  }
+  return env;
+}
+
 export async function launch(headless: boolean, display: Partial<Record<string, string>> = {}) {
   const profile = profileDir();
   await mkdir(profile, { recursive: true, mode: 0o700 });
@@ -54,8 +65,7 @@ export async function launch(headless: boolean, display: Partial<Record<string, 
       }
     }
   }
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries({ ...process.env, ...display })) if (value !== undefined) env[key] = value;
+  const env = childEnv(display);
   const context = await chromium.launchPersistentContext(profile, {
     headless,
     executablePath,

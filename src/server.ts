@@ -7,10 +7,10 @@ import { execFile } from "node:child_process";
 import { chmod, mkdir, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 import { connect } from "node:net";
-import { displayVariables, launch } from "./browser.js";
+import { childEnv, displayVariables, launch } from "./browser.js";
 import { controlSocketPath } from "./control.js";
 import { MailError, Outlook, searchResultLimit, type AuthState } from "./outlook.js";
-import { inspectPasswordFile } from "./reauth.js";
+import { inspectPasswordFile, passwordSource } from "./reauth.js";
 import { Calendar } from "./calendar.js";
 import { attachmentMime } from "./attachments.js";
 
@@ -24,6 +24,14 @@ if (!token || token.length < 32 || /\s/.test(token)) {
 const passwordFile = inspectPasswordFile();
 if (passwordFile.configured && !passwordFile.valid) {
   console.error("outlook-mcp: " + passwordFile.message);
+  process.exit(1);
+}
+try {
+  if (passwordSource().kind !== "none" && !process.env.OUTLOOK_USERNAME) {
+    console.error("outlook-mcp: a password is configured but OUTLOOK_USERNAME is not, so automatic sign-in is off.");
+  }
+} catch (error) {
+  console.error("outlook-mcp: " + (error as Error).message);
   process.exit(1);
 }
 const authorization = Buffer.from("Bearer " + token);
@@ -44,7 +52,7 @@ function notifyAuth(state: AuthState, detail?: { message?: string }) {
   const message = detail?.message ?? "Microsoft session expired. Run npm run login on the server host to sign in again.";
   console.error("outlook-mcp: " + message + " (directory " + process.cwd() + ")");
   if (process.env.OUTLOOK_NOTIFY === "0") return;
-  execFile("notify-send", ["--app-name=Outlook MCP", "--urgency=normal", "Outlook sign-in needed", message], () => {});
+  execFile("notify-send", ["--app-name=Outlook MCP", "--urgency=normal", "Outlook sign-in needed", message], { env: childEnv() }, () => {});
 }
 
 // read_attachment is on unless OUTLOOK_ATTACHMENTS=0. Files above OUTLOOK_ATTACHMENT_MAX_MB are refused.
@@ -81,6 +89,8 @@ function mailStatus(status: ReturnType<Outlook["status"]>) {
     password_file_path: file.path,
     password_file_problem: file.problem,
     password_file_hints: file.hints,
+    auto_sign_in_username: status.credentials.username,
+    auto_sign_in_password_source: status.credentials.password_source,
   };
 }
 
@@ -147,7 +157,7 @@ function buildMcp() {
   const statusAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
   mcp.registerTool("mail_status", {
     description: "Report sign-in diagnostics without reading mail: whether Outlook is signed in, whether the browser is running, " +
-      "the last success or error, and whether OUTLOOK_PASSWORD_FILE is configured and valid. Does not sign in, sign out, or change mail. " +
+      "the last success or error, which automatic sign-in credentials are configured (never the password), and whether OUTLOOK_PASSWORD_FILE is valid. Does not sign in, sign out, or change mail. " +
       "password_file_path is the configured path; file contents are never returned.",
     annotations: statusAnnotations,
   }, () => {
@@ -227,7 +237,7 @@ const control = createServer(async (req, res) => {
       raw += chunk;
       if (raw.length > 4096) return reply(413, { code: "TOO_LARGE", message: "Request too large." });
     }
-    let body: { display?: Record<string, unknown> };
+    let body: { display?: Record<string, unknown>; nonInteractive?: unknown };
     try {
       const parsed: unknown = raw ? JSON.parse(raw) : {};
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -240,6 +250,10 @@ const control = createServer(async (req, res) => {
     if (req.url === "/check") return reply(200, await outlook.check());
     if (req.url === "/logout") return reply(200, await outlook.logout());
     if (req.url === "/login") {
+      if (body.nonInteractive === true) {
+        const result = await outlook.signInNonInteractive();
+        return reply(200, { result, ...outlook.status() });
+      }
       const display: Record<string, string> = {};
       for (const key of displayVariables) {
         const value = body.display?.[key];

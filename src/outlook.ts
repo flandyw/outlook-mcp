@@ -1122,23 +1122,39 @@ export class Outlook {
       });
       const roots = eligible.filter(node => !eligible.some(other => other !== node && other.contains(node)));
       const parts: BodyPart[] = [];
-      let remaining = maxBodyChars + 1;
+      let committed = 0;
+      let separator = false;
       let truncated = false;
-      const take = (text: string) => {
-        let result = "";
-        for (const char of text) {
-          if (remaining <= 0) { truncated = true; break; }
-          result += char;
-          remaining--;
-        }
-        return result;
-      };
       for (const [index, root] of roots.entries()) {
         if (truncated) break;
-        if (index) { parts.push({ kind: "separator", text: "" }); remaining -= 5; }
+        if (index) separator = true;
         let buffer = "";
+        let buffered = 0;
+        let whitespace = "";
+        const overhead = () => parts.length ? separator ? 7 : 2 : 0;
+        const append = (text: string) => {
+          const budget = Math.max(1, maxBodyChars + 1 - committed - overhead());
+          for (const char of text) {
+            if (char === " ") {
+              if (buffer && !whitespace.includes("\n")) whitespace = " ";
+              continue;
+            }
+            if (char === "\n") {
+              if (buffer) whitespace = whitespace.includes("\n") ? "\n\n" : "\n";
+              continue;
+            }
+            if (buffered >= budget) { truncated = true; break; }
+            buffer += whitespace + char;
+            buffered += whitespace.length + 1;
+            whitespace = "";
+            if (buffered > budget) { truncated = true; break; }
+          }
+        };
         const flush = (kind: BodyPart["kind"]) => {
-          if (buffer.trim()) {
+          if (buffer) {
+            committed += overhead();
+            if (separator && parts.length) parts.push({ kind: "separator", text: "" });
+            separator = false;
             parts.push({ kind, text: buffer });
             const clean = buffer.split("\n").map(line => line.replace(/[ \t ]+/g, " ").trim()).join("\n")
               .replace(/\n{3,}/g, "\n\n").trim();
@@ -1147,21 +1163,23 @@ export class Outlook {
               .replace(/^(\s*)(={3,}|-{3,}|_{3,}|\*{3,})\s*$/gm, "$1\\$2");
             const rendered = kind === "bullet" ? "- " + safe.replace(/\n/g, "\n  ")
               : kind === "quote" ? safe.split("\n").map(line => "> " + line).join("\n") : safe;
-            remaining += Array.from(buffer).length - Array.from(rendered).length - (parts.length > 1 ? 2 : 0);
-            if (remaining < 0) truncated = true;
-          } else remaining += Array.from(buffer).length;
+            committed += Array.from(rendered).length;
+            if (committed > maxBodyChars) truncated = true;
+          }
           buffer = "";
+          buffered = 0;
+          whitespace = "";
         };
         const walk = (node: Node, kind: BodyPart["kind"]) => {
           for (const child of node.childNodes) {
             if (truncated) break;
             if (child.nodeType === Node.TEXT_NODE) {
-              buffer += take((child.textContent ?? "").replace(/\s+/g, " "));
+              append((child.textContent ?? "").replace(/\s+/g, " "));
               continue;
             }
             if (child instanceof HTMLImageElement) {
               const alt = child.alt.replace(/\s+/g, " ").trim();
-              if (alt.length > 1 && !child.hidden) buffer += take(" (image: " + alt + ") ");
+              if (alt.length > 1 && !child.hidden) append(" (image: " + alt + ") ");
               continue;
             }
             if (!(child instanceof HTMLElement) || child.hidden || child.getAttribute("aria-hidden") === "true" ||
@@ -1169,19 +1187,18 @@ export class Outlook {
             const style = getComputedStyle(child);
             if (style.display === "none" || style.visibility === "hidden") continue;
             if (child.tagName === "BR") {
-              buffer += take("\n");
+              append("\n");
               continue;
             }
             // Data tables become "a | b" rows. Layout tables (one cell or nested tables) are walked normally.
             if (child instanceof HTMLTableRowElement && child.cells.length > 1 && !child.querySelector("table")) {
               flush(kind);
-              let text = "";
               for (const cell of child.cells) {
                 const value = cell.innerText.replace(/\s+/g, " ").trim();
-                if (value) text += take((text ? " | " : "") + value);
+                if (value) append((buffer ? " | " : "") + value);
                 if (truncated) break;
               }
-              if (text) { buffer = text; flush("row"); }
+              flush("row");
               continue;
             }
             const block = !style.display.startsWith("inline");
@@ -1189,9 +1206,7 @@ export class Outlook {
               : child.tagName === "HR" ? "separator" : kind;
             if (block) flush(kind);
             if (inner === "separator" && kind !== "separator") {
-              parts.push({ kind: "separator", text: "" });
-              remaining -= 5;
-              if (remaining < 0) truncated = true;
+              separator = true;
             }
             else walk(child, inner);
             if (block) flush(inner);

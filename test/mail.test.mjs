@@ -349,6 +349,30 @@ test("reads empty and image-only bodies without polling for visible body dimensi
   assert.equal(short.truncated, true);
   for (const limit of [0, 12001, 1.5]) await assert.rejects(outlook.read(id, limit), { code: "INVALID_RANGE" });
   assert.equal(await page.evaluate(() => window.tailVisits), 0);
+  for (const [html, expected] of [
+    ['<span>a </span>' + '<span> </span>'.repeat(50) + '<span> b </span>', 'a b'],
+    ['<span> </span>'.repeat(50) + '<span>abc</span>' + '<span> </span>'.repeat(50), 'abc'],
+    ['<span> </span>'.repeat(50), ''],
+    ['<span>😀 </span>' + '<span> </span>'.repeat(50) + '<span> 😀</span>', '😀 😀'],
+    ['<p>a <span> </span><br><span> </span><br><br> b </p>', 'a\n\nb'],
+    ['<ul><li>a <span> </span> b</li></ul>', '- a b'],
+    ['<blockquote>a <span> </span> b<br>c</blockquote>', '> a b\n> c'],
+    ['<p>a</p><hr><hr>', 'a'],
+    ['<p>a</p><hr><hr><p>b</p>', 'a\n\n---\n\nb'],
+    ['<p>&lt; <span> </span>x &gt;</p>', '\\< x \\>'],
+    ['<table><tr><td>a </td><td> b</td></tr></table>', 'a | b'],
+  ]) {
+    await page.locator('#UniqueMessageBody_1').evaluate((node, html) => { node.innerHTML = html; }, html);
+    const length = Array.from(expected).length;
+    const fitting = await outlook.read(id, Math.max(1, length));
+    assert.equal(fitting.body_markdown, expected, html);
+    assert.equal(fitting.truncated, false, html);
+    if (length > 1) {
+      const clipped = await outlook.read(id, length - 1);
+      assert.equal(clipped.body_markdown, Array.from(expected).slice(0, -1).join('').trimEnd(), html);
+      assert.equal(clipped.truncated, true, html);
+    }
+  }
   await page.locator('#UniqueMessageBody_1').evaluate(node => {
     node.remove();
     setTimeout(() => { document.querySelector('[aria-label="Reading Pane"]').insertAdjacentHTML('beforeend',

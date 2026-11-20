@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { launchChromium } from "./chromium.mjs";
 import { Calendar, parseCalendarDate } from "../dist/calendar.js";
-import { Outlook } from "../dist/outlook.js";
+import { Outlook, MailError } from "../dist/outlook.js";
 import { toolContracts } from "../dist/tool-contracts.js";
 
 const fixture = name => readFileSync(new URL("./fixtures/calendar/" + name, import.meta.url), "utf8");
@@ -94,6 +94,23 @@ function calendarTab(context) {
   assert.ok(pages.length, "calendar tab was not opened");
   return pages[0];
 }
+
+test("calendar transient reads retry once on a newly established day view", async t => {
+  const { calendar, context } = await start(t, serve(calendarHtml()));
+  const found = await calendar.search({ start: "2026-11-12" });
+  const old = calendarTab(context);
+  const extract = calendar.extractDetails.bind(calendar);
+  let calls = 0;
+  calendar.extractDetails = (...args) => {
+    if (++calls === 1) throw new MailError("UI_CHANGED", "transient peek");
+    return extract(...args);
+  };
+  const read = await calendar.read(found.events[0].event_id);
+  assert.equal(read.title, found.events[0].title);
+  assert.equal(calls, 2);
+  assert.equal(old.isClosed(), true);
+  assert.notEqual(calendarTab(context), old);
+});
 
 test("lists and reads day-view events without touching mail or event actions", async t => {
   const { context, outlook, calendar, leaks } = await start(t, serve(calendarHtml()));

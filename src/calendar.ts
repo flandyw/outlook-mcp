@@ -530,9 +530,11 @@ export class Calendar {
         this.outlook.checkpoint();
         try {
           results[item.index] = { event_id: item.event_id, data: await this.readInContext(context, this.reference(item.event_id), item.event_id) };
+          this.outlook.preventRetry();
         } catch (error) {
           this.outlook.checkpoint();
           if (error instanceof SessionLostError) throw error;
+          if (this.outlook.canRetry(error)) throw error;
           results[item.index] = { event_id: item.event_id, error: errorInfo(error) };
         }
       }
@@ -561,6 +563,7 @@ export class Calendar {
           throw new MailError("UI_CHANGED", "Could not find the event details.");
         }
         if (await this.isEditor(dialog)) {
+          this.outlook.preventRetry();
           editor = true;
           await this.abandonEditor(page);
         }

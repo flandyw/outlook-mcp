@@ -15,7 +15,7 @@ export class MailError extends Error {
 export function errorInfo(error: unknown) {
   const code = error instanceof MailError ? error.code : "INTERNAL_ERROR";
   return { code, message: error instanceof MailError ? error.message : "The operation failed.",
-    retryable: ["TIMEOUT", "NETWORK_ERROR", "BROWSER_RESTARTED", "DOWNLOAD_FAILED", "STORAGE_FULL"].includes(code) };
+    retryable: ["TIMEOUT", "UI_CHANGED", "NETWORK_ERROR", "BROWSER_RESTARTED", "DOWNLOAD_FAILED", "STORAGE_FULL"].includes(code) };
 }
 
 /**
@@ -209,11 +209,33 @@ export class Outlook {
   /** Tabs owned by another read-only surface, such as calendar. Mail must not type into them. */
   private reserved = new Set<Page>();
   private queue = Promise.resolve();
-  private operation = new AsyncLocalStorage<() => void>();
+  private operation = new AsyncLocalStorage<{ checkpoint: () => void; retryAllowed: boolean }>();
   private references = new Map<string, Reference>();
 
   checkpoint() {
-    this.operation.getStore()?.();
+    this.operation.getStore()?.checkpoint();
+  }
+
+  preventRetry() {
+    const operation = this.operation.getStore();
+    if (operation) operation.retryAllowed = false;
+  }
+
+  canRetry(error: unknown) {
+    return this.operation.getStore()?.retryAllowed && ["TIMEOUT", "UI_CHANGED", "NETWORK_ERROR", "BROWSER_RESTARTED", "DOWNLOAD_FAILED"]
+      .includes(this.classify(error).code);
+  }
+
+  private async cleanView() {
+    this.checkpoint();
+    for (const page of this.reserved) {
+      await page.close().catch(() => {});
+      this.checkpoint();
+    }
+    this.lastSearchQuery = undefined;
+    const page = await this.ensurePage();
+    await this.ensureMailbox(page, true);
+    this.checkpoint();
   }
 
   status() {
@@ -341,24 +363,34 @@ export class Outlook {
       running = true;
       if (this.busy) throw this.busyError();
       clearTimeout(this.idleTimer);
-      return this.operation.run(checkpoint, async () => {
+      const operation = { checkpoint, retryAllowed: true };
+      return this.operation.run(operation, async () => {
       try {
         this.recoveryTried = false;
         const attempt = async () => {
-          const page = await this.ensurePage();
-          checkpoint();
-          try {
-            const value = await work(page);
-            checkpoint();
-            return value;
-          } catch (error) {
-            checkpoint();
-            if (!await this.sessionLost(page, error)) throw error;
-            // Microsoft signed the browser out mid-operation. Recover once, then repeat the work.
-            console.error("outlook-mcp: the Microsoft session ended during a request; signing back in.");
-            await this.ensureMailbox(page, true);
-            checkpoint();
-            return await work(page);
+          for (;;) {
+            let page: Page | undefined;
+            try {
+              page = await this.ensurePage();
+              checkpoint();
+              const value = await work(page);
+              checkpoint();
+              return value;
+            } catch (error) {
+              checkpoint();
+              if (operation.retryAllowed && page && (error instanceof SessionLostError || !(error instanceof MailError) || this.canRetry(error))
+                  && await this.sessionLost(page, error)) {
+                operation.retryAllowed = false;
+                console.error("outlook-mcp: the Microsoft session ended during a request; signing back in.");
+                await this.ensureMailbox(page, true);
+                checkpoint();
+                continue;
+              }
+              if (!this.canRetry(error)) throw error;
+              operation.retryAllowed = false;
+              if (this.classify(error).code === "BROWSER_RESTARTED") await this.shutdownBrowser();
+              await this.cleanView();
+            }
           }
         };
         const value = await Promise.race([attempt(), stuck]);
@@ -920,6 +952,7 @@ export class Outlook {
     }
     const wasUnread = await this.rowWasUnread(candidate);
     this.checkpoint();
+    if (wasUnread) this.preventRetry();
     const clicked = await candidate.evaluate(async (node, { s, fingerprint }) => {
       const text = (selector: string) => node.querySelector(selector)?.textContent?.trim() ?? "";
       const timeNode = node.querySelector("time");
@@ -1052,9 +1085,11 @@ export class Outlook {
         this.checkpoint();
         try {
           results.push({ message_id, data: await this.readOnPage(page, this.reference(message_id), message_id, maxBodyChars) });
+          this.preventRetry();
         } catch (error) {
           this.checkpoint();
           if (await this.sessionLost(page, error)) throw error;
+          if (this.canRetry(error)) throw error;
           results.push({ message_id, error: errorInfo(this.classify(error)) });
         }
       }
@@ -1127,6 +1162,7 @@ export class Outlook {
           throw new MailError("ATTACHMENT_UNAVAILABLE", "Outlook offers no download for this attachment (it may be a cloud link).");
         }
         const item = items.nth(position);
+        this.preventRetry();
         const [download] = await Promise.all([page.waitForEvent("download", { timeout: 60_000 }), item.click()]);
         try {
           this.checkpoint();

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter, getEventListeners } from "node:events";
-import { Outlook } from "../dist/outlook.js";
+import { Outlook, MailError, errorInfo } from "../dist/outlook.js";
 
 function deferred() {
   let resolve;
@@ -13,6 +13,7 @@ function context() {
   const value = new EventEmitter();
   const page = new EventEmitter();
   page.isClosed = () => false;
+  page.url = () => "https://outlook.office.com/mail/";
   page.setDefaultTimeout = () => {};
   value.pages = () => [page];
   value.closed = false;
@@ -49,6 +50,84 @@ test("queue deadlines include waiting, drop expired/cancelled work and remove ab
   already.abort();
   await assert.rejects(outlook.useBrowser(async () => { ran++; }, already.signal), { code: "CANCELLED" });
   assert.equal(ran, 0);
+});
+
+test("transient operations get one clean-view retry; auth, validation and partial effects do not", async t => {
+  for (const code of ["UI_CHANGED", "TIMEOUT", "NETWORK_ERROR", "BROWSER_RESTARTED", "DOWNLOAD_FAILED", "AUTH_REQUIRED", "INVALID_RANGE", "MESSAGE_CHANGED", "STORAGE_FULL"]) {
+    const outlook = new Outlook(async () => context(), { operationMs: 2000 });
+    t.after(() => outlook.close());
+    let clean = 0, calls = 0;
+    outlook.ensureMailbox = async (page, force) => { if (force) clean++; };
+    outlook.sessionLost = async () => false;
+    const retryable = ["UI_CHANGED", "TIMEOUT", "NETWORK_ERROR", "BROWSER_RESTARTED", "DOWNLOAD_FAILED"].includes(code);
+    const work = () => outlook.useBrowser(async () => {
+      if (++calls === 1) throw new MailError(code, "fixture failure");
+      return "recovered";
+    });
+    if (retryable) {
+      assert.equal(await work(), "recovered", code);
+      assert.equal(calls, 2, code);
+      assert.equal(clean, 1, code);
+    } else {
+      await assert.rejects(work(), { code });
+      assert.equal(calls, 1, code);
+      assert.equal(clean, 0, code);
+    }
+  }
+  assert.equal(errorInfo(new MailError("UI_CHANGED", "changed")).retryable, true);
+  const outlook = new Outlook(async () => context());
+  t.after(() => outlook.close());
+  outlook.ensureMailbox = async () => {};
+  outlook.sessionLost = async () => false;
+  let calls = 0;
+  await assert.rejects(outlook.useBrowser(async () => {
+    calls++;
+    outlook.preventRetry();
+    throw new MailError("UI_CHANGED", "already saved");
+  }), { code: "UI_CHANGED" });
+  assert.equal(calls, 1);
+});
+
+test("a second transient failure is final and clean-view recovery closes calendar tabs", async t => {
+  const outlook = new Outlook(async () => context());
+  t.after(() => outlook.close());
+  outlook.ensureMailbox = async () => {};
+  outlook.sessionLost = async () => false;
+  let calls = 0;
+  const calendar = new EventEmitter();
+  let closed = false;
+  calendar.close = async () => { closed = true; calendar.emit("close"); };
+  outlook.holdPage(calendar);
+  await assert.rejects(outlook.useBrowser(async () => {
+    if (++calls === 2) assert.equal(closed, true);
+    throw new MailError("UI_CHANGED", "still changed");
+  }), { code: "UI_CHANGED", message: "still changed" });
+  assert.equal(calls, 2);
+});
+
+test("recovery stays within the original deadline and respects cancellation", async t => {
+  for (const cancelled of [false, true]) {
+    const outlook = new Outlook(async () => context(), { operationMs: cancelled ? 2000 : 50 });
+    t.after(() => outlook.close());
+    const cleaning = deferred(), release = deferred();
+    outlook.ensureMailbox = async (page, force) => {
+      if (force) { cleaning.resolve(); await release.promise; }
+    };
+    outlook.sessionLost = async () => false;
+    const controller = new AbortController();
+    let calls = 0;
+    const operation = outlook.useBrowser(async () => {
+      calls++;
+      throw new MailError("UI_CHANGED", "retry me");
+    }, controller.signal);
+    const rejected = assert.rejects(operation, { code: cancelled ? "CANCELLED" : "TIMEOUT" });
+    await cleaning.promise;
+    if (cancelled) controller.abort();
+    await rejected;
+    release.resolve();
+    await outlook.useBrowser(async () => {});
+    assert.equal(calls, 1, "no second work after cancellation/deadline during recovery");
+  }
 });
 
 test("launch is inside the enqueue deadline and a late browser is closed rather than adopted", async t => {

@@ -21,8 +21,11 @@ exposed tools: there is no send, reply, delete, move, or general flag action.
 
 ## Tools
 
+`list_mail` bypasses the search index, which can lag fresh arrivals. It navigates to a live folder URL, clearing active search, and scans up to 50 scroll windows. Parseable dates are sorted newest first; otherwise Outlook's visible order is retained. `scan_limit_reached` warns when scanning hit a bound or stopped making progress; `truncated` also covers omitted rows beyond `limit`. Only visible unread prefixes/badges are used for `unread_only`. Focused/Other and other Outlook view settings still determine which rows are exposed. Folder IDs work with `read_mail`, `read_mails`, and `read_attachment`, including after restart when they carry an Outlook key; they reopen the folder, never fall back to search. Drafts are list-only: reads return `DRAFT_UNAVAILABLE` rather than opening an editable composer. Search and folder rows include `unread`.
+
 | Tool | Input | Returns |
 | --- | --- | --- |
+| `list_mail` | `folder` (default `inbox`; also `sentitems`, `drafts`, `archive`, `junkemail`, `deleteditems`), `limit` 1–40 (default 10), `unread_only` (default false) | search-shaped rows including `unread`, plus folder, scan/truncation flags; newest parseable dates first |
 | `search_mail` | `query` (Outlook search syntax, e.g. `from:alice`, `subject:invoice`, `hasattachments:yes`), `limit` 1–40 | `message_id`, sender, subject, `received_at`, `has_attachments`, snippet for each identifiable result |
 | `read_mail` | `message_id` from `search_mail`; optional `max_body_chars` 1–12,000 (default 12,000) | sender, `to`, `cc`, `received_at`, `attachment_names`, `attachments` (`index`, `name`, visible `size_bytes`/`type` or null), `body_markdown`, `truncated` |
 | `read_mails` | `message_ids` (1–10 IDs); optional `max_body_chars` as above | `results` in input order, each with `message_id` and either `data` (read_mail result) or `error` |

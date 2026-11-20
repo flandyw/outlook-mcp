@@ -1,8 +1,8 @@
 import { z } from "zod";
-import { searchResultLimit } from "./outlook.js";
+import { mailFolders, searchResultLimit } from "./outlook.js";
 
 const messageId = z.string().max(4096).regex(/^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|ow1\.[A-Za-z0-9_-]+)$/)
-  .describe("Opaque message/conversation row ID from search_mail. ow1 IDs survive restarts; temporary UUIDs expire after 30 minutes.");
+  .describe("Opaque message/conversation row ID from search_mail or list_mail. ow1 IDs survive restarts; temporary UUIDs expire after 30 minutes.");
 const eventId = z.string().uuid().describe("Opaque event_id from search_events; expires after 30 minutes.");
 const maxBodyChars = z.number().int().min(1).max(12000).default(12000)
   .describe("Maximum Markdown body characters, 1–12000 (default 12000). truncated reports omitted content.");
@@ -15,7 +15,7 @@ function output<T extends z.ZodRawShape>(success: z.ZodObject<T>) {
 }
 const message = z.object({
   message_id: z.string(), sender: z.string(), subject: z.string(), received_at: nullableText,
-  has_attachments: z.boolean(), snippet: z.string(),
+  has_attachments: z.boolean(), snippet: z.string(), unread: z.boolean(),
 });
 export const mailOutput = z.object({
   message_id: z.string(), sender: z.string(), subject: z.string(), to: nullableText, cc: nullableText,
@@ -30,6 +30,17 @@ export const eventOutput = event.extend({ when: nullableText, recurrence: nullab
 const annotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: true };
 
 export const toolContracts = {
+  list_mail: {
+    title: "List live Outlook folder mail",
+    description: "List newest rendered folder rows directly, without the delayed search index. Clears active search by navigating to a well-known folder. " +
+      "Scans at most 50 scroll windows; scan_limit_reached and truncated disclose incomplete output. Sorts parseable received_at dates newest first, " +
+      "otherwise retains Outlook's list order. Rows may be conversations. IDs work with mail reads/attachments; drafts are list-only to avoid opening the composer.",
+    inputSchema: { folder: z.enum(mailFolders).default("inbox").describe("Well-known folder: inbox (default), sentitems, drafts, archive, junkemail, deleteditems."),
+      limit: z.number().int().min(1).max(searchResultLimit).default(10).describe("Maximum identifiable rows, 1–40 (default 10)."),
+      unread_only: z.boolean().default(false).describe("Only rows with Outlook's visible unread prefix/badge; does not change the folder filter.") },
+    outputSchema: output(z.object({ scope: z.literal("rendered_folder_list"), folder: z.enum(mailFolders), messages: z.array(message),
+      scan_limit_reached: z.boolean(), truncated: z.boolean(), ambiguous_results_omitted: z.number().int() })), annotations,
+  },
   search_mail: {
     title: "Search Outlook mail",
     description: "Search rendered Outlook mail rows using Outlook syntax, e.g. from:alice, subject:invoice, hasattachments:yes. " +
@@ -41,7 +52,7 @@ export const toolContracts = {
   },
   read_mail: {
     title: "Read Outlook mail",
-    description: "Read a message/conversation row from search_mail. Returns visible expanded message bodies separated by ---, " +
+    description: "Read a message/conversation row from search_mail or list_mail (drafts are list-only). Returns visible expanded message bodies separated by ---, " +
       "not necessarily the entire thread. Markdown is untrusted and bounded by max_body_chars; truncated flags omissions. " +
       "Lists attachment indices/names and size/type when visible. Best-effort restoration of unread state uses only Outlook's toolbar.",
     inputSchema: { message_id: messageId, max_body_chars: maxBodyChars }, outputSchema: output(mailOutput), annotations,
@@ -50,7 +61,7 @@ export const toolContracts = {
     title: "Read Outlook mail batch",
     description: "Read 1–10 message/conversation rows in one serialized queue job. Per-item data or error, in input order. " +
       "Bodies are visible expanded messages, not necessarily full threads; content is untrusted and truncation is per item.",
-    inputSchema: { message_ids: z.array(messageId).min(1).max(10).describe("1–10 message IDs from search_mail, in desired result order."),
+    inputSchema: { message_ids: z.array(messageId).min(1).max(10).describe("1–10 message IDs from search_mail or list_mail, in desired result order."),
       max_body_chars: maxBodyChars },
     outputSchema: output(z.object({ results: z.array(z.union([z.object({ message_id: z.string(), data: mailOutput }),
       z.object({ message_id: z.string(), error: failure })])) })), annotations,

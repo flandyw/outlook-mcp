@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { launchChromium } from "./chromium.mjs";
 import { Calendar, parseCalendarDate } from "../dist/calendar.js";
 import { Outlook } from "../dist/outlook.js";
+import { toolContracts } from "../dist/tool-contracts.js";
 
 const fixture = name => readFileSync(new URL("./fixtures/calendar/" + name, import.meta.url), "utf8");
 const mailShell = fixture("mail-shell.html");
@@ -18,6 +19,27 @@ test("parses English calendar headings and rejects impossible dates", () => {
   assert.equal(parseCalendarDate("Wednesday, November 12, 2026"), "2026-11-12");
   assert.equal(parseCalendarDate("31 November 2026"), null);
   assert.equal(parseCalendarDate("no date here"), null);
+});
+
+test("batch reads group events by day in one queue job and preserve input/error order", async t => {
+  const loaded = [];
+  const { calendar, outlook } = await start(t, serve(url => { loaded.push(url.pathname); return calendarHtml(); }));
+  const found = await calendar.search({ start: "2026-11-12", end: "2026-11-13" });
+  const ids = found.events.map(e => e.event_id);
+  loaded.length = 0;
+  let jobs = 0;
+  const useBrowser = outlook.useBrowser.bind(outlook);
+  outlook.useBrowser = (...args) => { jobs++; return useBrowser(...args); };
+  const input = [ids[2], ids[0], "missing", ids[1]];
+  const batch = await calendar.readEvents(input);
+  assert.equal(jobs, 1);
+  assert.deepEqual(batch.results.map(item => item.event_id), input);
+  assert.deepEqual(batch.results.map(item => item.data?.title ?? item.error.code), ["Assembly", "Specialist Maths", "UNKNOWN_EVENT", "Chemistry prac"]);
+  assert.equal(batch.results[2].error.retryable, false);
+  assert.equal(loaded.length, 2, "one load per requested day, not per event");
+  toolContracts.read_events.outputSchema.parse(batch);
+  assert.throws(() => calendar.readEvents([]), { code: "INVALID_RANGE" });
+  assert.throws(() => calendar.readEvents(Array(11).fill(ids[0])), { code: "INVALID_RANGE" });
 });
 
 test("rejects a bad range or unknown event without launching a browser", async () => {
@@ -80,6 +102,7 @@ test("lists and reads day-view events without touching mail or event actions", a
   const messageId = mail.messages[0].message_id;
 
   const today = await calendar.search({ limit: 10 });
+  toolContracts.search_events.outputSchema.parse(today);
   assert.equal(today.scope, "rendered_day_view");
   assert.deepEqual([today.start, today.end, today.query], ["2026-11-12", "2026-11-12", null]);
   assert.deepEqual(today.events.map(event => event.title), ["Specialist Maths", "Chemistry prac"]);
@@ -114,6 +137,7 @@ test("lists and reads day-view events without touching mail or event actions", a
 
   const mathsId = today.events[0].event_id;
   const maths = await calendar.read(mathsId);
+  toolContracts.read_event.outputSchema.parse(maths);
   assert.equal(maths.title, "Specialist Maths");
   assert.equal(maths.location, "Room 4");
   assert.equal(maths.when, "Thursday, 12 November 2026 9:00 AM – 10:15 AM");
@@ -212,12 +236,69 @@ test("discards an event editor instead of saving it", async t => {
 });
 
 test("returns EVENT_CHANGED when the opened day no longer shows the event", async t => {
-  let navigations = 0;
-  const { calendar } = await start(t, serve(() => {
-    navigations += 1;
-    return calendarHtml({ drop: navigations > 1 });
-  }));
+  const { context, calendar } = await start(t, serve(calendarHtml()));
   const day = await calendar.search({ start: "2026-11-12", limit: 5 });
+  await calendarTab(context).locator('[data-event-id="evt-maths"]').evaluateAll(nodes => nodes.forEach(node => node.remove()));
+  await assert.rejects(calendar.read(day.events[0].event_id), { code: "EVENT_CHANGED" });
+});
+
+test("reuses a verified day for default searches and reads but verifies live date and events", async t => {
+  let loads = 0;
+  const { context, calendar } = await start(t, serve(() => { loads++; return calendarHtml(); }));
+  const first = await calendar.search();
+  assert.equal(loads, 1, "default search loads the first day only once");
+  await calendar.search({ start: first.start });
+  await calendar.read(first.events[0].event_id);
+  await calendar.read(first.events[1].event_id);
+  assert.equal(loads, 1, "same-day search and reads do not navigate");
+  await calendarTab(context).getByRole("button", { name: "Next day", exact: true }).click();
+  await calendar.search({ start: first.start });
+  assert.equal(loads, 2, "a changed displayed date must be realigned");
+  await calendarTab(context).goto("https://outlook.office.com/mail/");
+  await calendar.read(first.events[0].event_id);
+  assert.equal(loads, 3, "a tab navigated away from calendar must be restored");
+});
+
+test("filters and deduplicates per day before stopping at the result limit", async t => {
+  const loaded = [];
+  const { calendar } = await start(t, serve(url => { loaded.push(url.pathname); return calendarHtml(); }));
+  const first = await calendar.search({ start: "2026-11-12", end: "2026-11-14", limit: 2 });
+  assert.deepEqual(first.events.map(event => event.title), ["Specialist Maths", "Chemistry prac"]);
+  assert.deepEqual([first.start, first.end, first.scanned_start, first.scanned_end, first.stopped_early, first.truncated],
+    ["2026-11-12", "2026-11-14", "2026-11-12", "2026-11-12", true, true]);
+  assert.equal(loaded.length, 1);
+  const hall = await calendar.search({ start: "2026-11-12", end: "2026-11-14", query: "hall", limit: 1 });
+  assert.deepEqual(hall.events.map(event => event.title), ["Assembly"]);
+  assert.equal(hall.scanned_end, "2026-11-13");
+  assert.equal(hall.stopped_early, true);
+  assert.equal(loaded.length, 2, "nonmatching events do not satisfy the limit");
+  const empty = await calendar.search({ start: "2026-11-12", end: "2026-11-14", query: "missing", limit: 1 });
+  assert.deepEqual(empty.events, []);
+  assert.deepEqual([empty.scanned_start, empty.scanned_end, empty.stopped_early, empty.truncated],
+    ["2026-11-12", "2026-11-14", false, false]);
+  const one = await calendar.search({ start: "2026-11-12", limit: 1 });
+  assert.equal(one.stopped_early, false);
+  assert.equal(one.truncated, true, "a completely scanned day may still have omitted hits");
+});
+
+test("snapshots visible metadata, datetime attributes and absent optional event fields", async t => {
+  const html = calendarHtml().replace('<div data-testid="event-where"></div>',
+    '<div data-testid="event-where" style="visibility:hidden"></div><time data-testid="event-start" datetime="custom-start"></time><time data-testid="event-end" datetime="custom-end"></time>');
+  const { calendar } = await start(t, serve(html));
+  const day = await calendar.search();
+  const details = await calendar.read(day.events[1].event_id);
+  assert.equal(details.start, "custom-start");
+  assert.equal(details.end, "custom-end");
+  assert.equal(details.location, "Lab 2", "hidden location falls back to the verified card");
+  assert.equal(details.recurrence, null);
+  assert.deepEqual(details.attendees, []);
+  assert.equal(details.body_markdown, "Safety glasses.");
+});
+
+test("rejects mismatched event peek titles before extracting metadata", async t => {
+  const html = calendarHtml().replace('item.title;', '"Different event";');
+  const { calendar } = await start(t, serve(html));
+  const day = await calendar.search();
   await assert.rejects(calendar.read(day.events[0].event_id), { code: "EVENT_CHANGED" });
 });
 

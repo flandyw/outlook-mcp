@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { BrowserContext, Page } from "playwright";
-import { mailbox, outlookOrigins, safeOrigin, signInOrigins } from "./browser.js";
+import { mailbox, outlookOrigins, safeOrigin } from "./browser.js";
 import { formatBody, type BodyPart } from "./format.js";
-import { MailError, SessionLostError, type Outlook } from "./outlook.js";
+import { MailError, SessionLostError, errorInfo, waitForSurface, type Outlook } from "./outlook.js";
 import { isMicrosoftLogin } from "./reauth.js";
 
 const signInHelp = "Run npm run login on the server host to sign in again.";
@@ -152,50 +152,71 @@ function sortKey(event: ListedEvent) {
 
 // Same walk as the mail reading pane so event notes follow the same Markdown rules:
 // images become alt text, hidden nodes drop out, and links contribute only their text.
-function eventNotes(root: Element): BodyPart[] {
-  const parts: BodyPart[] = [];
-  let buffer = "";
-  const flush = (kind: BodyPart["kind"]) => {
-    if (buffer.trim()) parts.push({ kind, text: buffer });
-    buffer = "";
+function eventSnapshot(dialog: Element, s: typeof selectors) {
+  const textOf = (selector: string) => {
+    const node = dialog.querySelector<HTMLElement>(selector);
+    if (!node) return null;
+    const style = getComputedStyle(node);
+    if (style.visibility === "hidden" || style.visibility === "collapse" || !node.getClientRects().length) return null;
+    return node.innerText;
   };
-  const walk = (node: Node, kind: BodyPart["kind"]) => {
-    for (const child of node.childNodes) {
-      if (child.nodeType === Node.TEXT_NODE) {
-        buffer += (child.textContent ?? "").replace(/\s+/g, " ");
-        continue;
+  const attribute = (selector: string) => dialog.querySelector(selector)?.getAttribute("datetime") ?? null;
+  const attendees = Array.from(dialog.querySelectorAll(s.attendee)).slice(0, 40).flatMap(node => {
+    const name = (node.querySelector("[data-testid='attendee-name']")?.textContent
+      ?? node.textContent?.split(",")[0] ?? "").replace(/\s+/g, " ").trim();
+    const status = (node.querySelector("[data-testid='attendee-status']")?.textContent
+      ?? (node.textContent?.includes(",") ? node.textContent.split(",").slice(1).join(",") : "")).replace(/\s+/g, " ").trim();
+    return name ? [{ name: name.slice(0, 200), response: status ? status.slice(0, 80) : null }] : [];
+  });
+  const notes = dialog.querySelector(s.notes);
+  return { when: textOf(s.when), where: textOf(s.where), recurrence: textOf(s.recurrence),
+    startAttr: attribute(s.start), endAttr: attribute(s.end), attendees, parts: notes ? eventNotes(notes) : [] };
+
+  function eventNotes(root: Element): BodyPart[] {
+    const parts: BodyPart[] = [];
+    let buffer = "";
+    const flush = (kind: BodyPart["kind"]) => {
+      if (buffer.trim()) parts.push({ kind, text: buffer });
+      buffer = "";
+    };
+    const walk = (node: Node, kind: BodyPart["kind"]) => {
+      for (const child of node.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          buffer += (child.textContent ?? "").replace(/\s+/g, " ");
+          continue;
+        }
+        if (child instanceof HTMLImageElement) {
+          const alt = child.alt.replace(/\s+/g, " ").trim();
+          if (alt.length > 1 && !child.hidden) buffer += " (image: " + alt + ") ";
+          continue;
+        }
+        if (!(child instanceof HTMLElement) || child.hidden || child.getAttribute("aria-hidden") === "true" ||
+            ["SCRIPT", "STYLE", "HEAD", "TITLE", "TEMPLATE", "svg"].includes(child.tagName)) continue;
+        const style = getComputedStyle(child);
+        if (style.display === "none" || style.visibility === "hidden") continue;
+        if (child.tagName === "BR") {
+          buffer += "\n";
+          continue;
+        }
+        if (child instanceof HTMLTableRowElement && child.cells.length > 1 && !child.querySelector("table")) {
+          flush(kind);
+          const cells = Array.from(child.cells, cell => cell.innerText.replace(/\s+/g, " ").trim()).filter(Boolean);
+          if (cells.length) parts.push({ kind: "row", text: cells.join(" | ") });
+          continue;
+        }
+        const block = !style.display.startsWith("inline");
+        const inner = child.tagName === "LI" ? "bullet" : child.tagName === "BLOCKQUOTE" ? "quote"
+          : child.tagName === "HR" ? "separator" : kind;
+        if (block) flush(kind);
+        if (inner === "separator" && kind !== "separator") parts.push({ kind: "separator", text: "" });
+        else walk(child, inner);
+        if (block) flush(inner);
       }
-      if (child instanceof HTMLImageElement) {
-        const alt = child.alt.replace(/\s+/g, " ").trim();
-        if (alt.length > 1 && !child.hidden) buffer += " (image: " + alt + ") ";
-        continue;
-      }
-      if (!(child instanceof HTMLElement) || child.hidden || child.getAttribute("aria-hidden") === "true" ||
-          ["SCRIPT", "STYLE", "HEAD", "TITLE", "TEMPLATE", "svg"].includes(child.tagName)) continue;
-      const style = getComputedStyle(child);
-      if (style.display === "none" || style.visibility === "hidden") continue;
-      if (child.tagName === "BR") {
-        buffer += "\n";
-        continue;
-      }
-      if (child instanceof HTMLTableRowElement && child.cells.length > 1 && !child.querySelector("table")) {
-        flush(kind);
-        const cells = Array.from(child.cells, cell => cell.innerText.replace(/\s+/g, " ").trim()).filter(Boolean);
-        if (cells.length) parts.push({ kind: "row", text: cells.join(" | ") });
-        continue;
-      }
-      const block = !style.display.startsWith("inline");
-      const inner = child.tagName === "LI" ? "bullet" : child.tagName === "BLOCKQUOTE" ? "quote"
-        : child.tagName === "HR" ? "separator" : kind;
-      if (block) flush(kind);
-      if (inner === "separator" && kind !== "separator") parts.push({ kind: "separator", text: "" });
-      else walk(child, inner);
-      if (block) flush(inner);
-    }
-  };
-  walk(root, "paragraph");
-  flush("paragraph");
-  return parts;
+    };
+    walk(root, "paragraph");
+    flush("paragraph");
+    return parts;
+  }
 }
 
 /**
@@ -209,6 +230,7 @@ export class Calendar {
   constructor(private readonly outlook: Outlook) {}
 
   private calendar?: Page;
+  private verifiedDay?: { page: Page; url: string };
   private nav = 0;
   private refs = new Map<string, EventRef>();
 
@@ -244,17 +266,9 @@ export class Calendar {
 
   private async waitForCalendar(page: Page) {
     const surface = this.surface(page);
-    const surfaceWait = surface.waitFor({ state: "visible", timeout: 20000 }).then(() => true, () => false);
-    const loginWait = page.waitForURL(url => {
-      const value = typeof url === "string" ? url : url.toString();
-      return signInOrigins.has(safeOrigin(value));
-    }, { timeout: 20000 }).then(() => true, () => false);
-    const winner = await Promise.race([
-      loginWait.then(seen => seen ? "login" as const : "later" as const),
-      surfaceWait.then(seen => seen ? "surface" as const : "later" as const),
-    ]);
+    const winner = await waitForSurface(page, surface, 20000, () => this.outlook.checkpoint());
     if (winner === "login" || isMicrosoftLogin(page)) this.authRequired();
-    if (winner !== "surface" && !await surfaceWait) {
+    if (winner !== "ready") {
       if (page.url().startsWith("chrome-error:")) {
         throw new MailError("NETWORK_ERROR", "Could not reach Outlook. Check the network connection and try again.");
       }
@@ -317,6 +331,15 @@ export class Calendar {
   }
 
   private async openDay(page: Page, date?: string) {
+    this.outlook.checkpoint();
+    if (this.verifiedDay?.page === page && this.verifiedDay.url === page.url()
+        && outlookOrigins.has(safeOrigin(page.url())) && await this.surface(page).isVisible().catch(() => false)) {
+      const shown = await this.readShownDate(page).catch(() => null);
+      const dayView = !await page.locator('[data-app-section="CalendarModule"]').count()
+        || await page.locator('[data-app-section="Surface_Day"]').count() > 0;
+      if (shown && dayView && (!date || shown === date)) return shown;
+    }
+    this.verifiedDay = undefined;
     const origin = outlookOrigins.has(safeOrigin(page.url())) ? safeOrigin(page.url()) : mailbox.origin;
     await page.goto(this.dayUrl(date, origin), { waitUntil: "domcontentloaded", timeout: 20000 });
     await this.waitForCalendar(page);
@@ -326,10 +349,10 @@ export class Calendar {
       }
       await page.locator('[data-app-section="Surface_Day"] [data-column-date]').first().waitFor({ state: "attached" });
     }
-    if (!date) return this.readShownDate(page);
-    await this.alignDate(page, date);
+    if (date) await this.alignDate(page, date);
     const shown = await this.readShownDate(page);
-    if (shown !== date) throw new MailError("UI_CHANGED", "Could not open the requested calendar day.");
+    if (date && shown !== date) throw new MailError("UI_CHANGED", "Could not open the requested calendar day.");
+    this.verifiedDay = { page, url: page.url() };
     return shown;
   }
 
@@ -446,7 +469,7 @@ export class Calendar {
     return ref;
   }
 
-  async search(input: CalendarSearch = {}) {
+  async search(input: CalendarSearch = {}, signal?: AbortSignal) {
     const limit = input.limit ?? 10;
     if (!Number.isInteger(limit) || limit < 1 || limit > 25) {
       throw new MailError("INVALID_RANGE", "limit must be an integer from 1 to 25.");
@@ -464,29 +487,61 @@ export class Calendar {
       const end = input.end ?? start;
       assertRange(start, end);
       const collected: ListedEvent[] = [];
+      const seen = new Set<string>();
+      const needle = query?.toLowerCase();
+      let scannedEnd = start;
       for (const date of eachDate(start, end)) {
         await this.openDay(page, date);
-        collected.push(...await this.collect(page, date));
+        const daily = await this.collect(page, date);
+        for (const event of daily) {
+          if (needle && !event.title.toLowerCase().includes(needle) && !(event.location ?? "").toLowerCase().includes(needle)) continue;
+          if (seen.has(event.fingerprint)) continue;
+          seen.add(event.fingerprint);
+          collected.push(event);
+        }
+        scannedEnd = date;
+        if (collected.length >= limit) break;
       }
-      const needle = query?.toLowerCase();
-      const matched = needle
-        ? collected.filter(event => event.title.toLowerCase().includes(needle) || (event.location ?? "").toLowerCase().includes(needle))
-        : collected;
-      const unique = matched.filter((event, index) => matched.findIndex(other => other.fingerprint === event.fingerprint) === index);
-      unique.sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
-      const events = unique.slice(0, limit).map(event => this.remember(event));
+      collected.sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
+      const events = collected.slice(0, limit).map(event => this.remember(event));
       this.prune();
-      return { events, scope: "rendered_day_view" as const, start, end, query: query ?? null };
-    });
+      return { events, scope: "rendered_day_view" as const, start, end, query: query ?? null,
+        scanned_start: start, scanned_end: scannedEnd, stopped_early: scannedEnd < end,
+        truncated: scannedEnd < end || collected.length > limit };
+    }, signal);
   }
 
   /**
    * Opens the event peek. Single click only. If Outlook shows the editor (a title
    * box plus Save), Escape and Discard run and the read fails closed — Save is not clicked.
    */
-  async read(id: string): Promise<EventDetails> {
+  async read(id: string, signal?: AbortSignal): Promise<EventDetails> {
     const ref = this.reference(id);
+    return this.outlook.useBrowser(context => this.readInContext(context, ref, id), signal);
+  }
+
+  readEvents(ids: string[], signal?: AbortSignal) {
+    if (!ids.length || ids.length > 10) throw new MailError("INVALID_RANGE", "Pass 1 to 10 event IDs.");
     return this.outlook.useBrowser(async context => {
+      const pending = ids.map((event_id, index) => ({ event_id, index, date: this.refs.get(event_id)?.date ?? "" }));
+      pending.sort((a, b) => a.date.localeCompare(b.date));
+      const results: { event_id: string; data?: EventDetails; error?: ReturnType<typeof errorInfo> }[] = new Array(ids.length);
+      for (const item of pending) {
+        this.outlook.checkpoint();
+        try {
+          results[item.index] = { event_id: item.event_id, data: await this.readInContext(context, this.reference(item.event_id), item.event_id) };
+        } catch (error) {
+          this.outlook.checkpoint();
+          if (error instanceof SessionLostError) throw error;
+          results[item.index] = { event_id: item.event_id, error: errorInfo(error) };
+        }
+      }
+      return { results };
+    }, signal);
+  }
+
+  private async readInContext(context: BrowserContext, ref: EventRef, id: string): Promise<EventDetails> {
+      this.outlook.checkpoint();
       const page = await this.pageFor(context);
       await this.openDay(page, ref.date);
       const events = await this.collect(page, ref.date);
@@ -495,6 +550,7 @@ export class Calendar {
       const card = this.surface(page).locator(selectors.event).nth(match.index);
       const titleNode = card.locator(selectors.title).first();
       const target = await titleNode.count() ? titleNode : card;
+      this.outlook.checkpoint();
       let editor = false;
       try {
         await target.click({ clickCount: 1 });
@@ -508,11 +564,11 @@ export class Calendar {
           editor = true;
           await this.abandonEditor(page);
         }
+        this.outlook.checkpoint();
         return await this.extractDetails(dialog, ref, id);
       } finally {
         if (!editor) await page.keyboard.press("Escape").catch(() => {});
       }
-    });
   }
 
   private async isEditor(dialog: ReturnType<Page["locator"]>) {
@@ -534,33 +590,11 @@ export class Calendar {
     const title = clip((await heading.innerText({ timeout: 2000 }).catch(() => "")).replace(/\s+/g, " ").trim(), 300);
     if (!title) throw new MailError("UI_CHANGED", "Could not find the event title in the details view.");
     if (title !== ref.title) throw new MailError("EVENT_CHANGED", "The event details did not match the calendar item. Search again.");
-    const textOf = async (selector: string) => {
-      const node = dialog.locator(selector).first();
-      if (!await node.count() || !await node.isVisible().catch(() => false)) return null;
-      return clip(await node.innerText().catch(() => ""), 500) || null;
-    };
-    const when = await textOf(selectors.when);
-    const where = await textOf(selectors.where);
-    const recurrence = await textOf(selectors.recurrence);
-    const attribute = async (selector: string) => {
-      const node = dialog.locator(selector).first();
-      // count() does not wait. getAttribute would sit out the timeout when the peek has no time node.
-      if (!await node.count()) return null;
-      return node.getAttribute("datetime");
-    };
-    const startAttr = await attribute(selectors.start);
-    const endAttr = await attribute(selectors.end);
-    const attendees = await dialog.locator(selectors.attendee).evaluateAll(nodes => nodes.slice(0, 40).flatMap(node => {
-      const name = (node.querySelector("[data-testid='attendee-name']")?.textContent
-        ?? node.textContent?.split(",")[0] ?? "").replace(/\s+/g, " ").trim();
-      const status = (node.querySelector("[data-testid='attendee-status']")?.textContent
-        ?? (node.textContent?.includes(",") ? node.textContent.split(",").slice(1).join(",") : "")).replace(/\s+/g, " ").trim();
-      if (!name) return [];
-      return [{ name: name.slice(0, 200), response: status ? status.slice(0, 80) : null }];
-    }));
-    const notes = dialog.locator(selectors.notes).first();
-    const parts = await notes.count() ? await notes.evaluate(eventNotes) : [];
-    const whereText = where ?? ref.location;
+    const snapshot = await dialog.evaluate(eventSnapshot, selectors);
+    const { startAttr, endAttr, attendees, parts } = snapshot;
+    const when = clip(snapshot.when ?? "", 500) || null;
+    const recurrence = clip(snapshot.recurrence ?? "", 500) || null;
+    const whereText = (clip(snapshot.where ?? "", 500) || null) ?? ref.location;
     return {
       event_id: id, title, start: startAttr || ref.start, end: endAttr || ref.end, all_day: ref.allDay,
       location: whereText, date: ref.date, when, recurrence, attendees, ...formatBody(parts),

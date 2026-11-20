@@ -1,6 +1,7 @@
 import type { BrowserContext, Locator, Page } from "playwright";
 import { randomUUID } from "node:crypto";
-import { readdir, readFile, rm, stat } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { readdir, rm, stat, open } from "node:fs/promises";
 import { launch, mailbox, outlookOrigins, profileDir, ProfileLockedError, safeOrigin, signInOrigins } from "./browser.js";
 import { credentialsSummary, inspectPasswordFile, isMicrosoftLogin, PasswordFileError, passwordSource, reauthenticate, resumeSignIn, SignInError } from "./reauth.js";
 import { formatBody, type BodyPart } from "./format.js";
@@ -9,6 +10,12 @@ export class MailError extends Error {
   constructor(readonly code: string, message: string) {
     super(message);
   }
+}
+
+export function errorInfo(error: unknown) {
+  const code = error instanceof MailError ? error.code : "INTERNAL_ERROR";
+  return { code, message: error instanceof MailError ? error.message : "The operation failed.",
+    retryable: ["TIMEOUT", "NETWORK_ERROR", "BROWSER_RESTARTED", "DOWNLOAD_FAILED", "STORAGE_FULL"].includes(code) };
 }
 
 /**
@@ -43,9 +50,54 @@ const selectors = {
   keyAttributes: ["data-item-id", "data-convid"],
 };
 
+function mailMetadata(root: Element, { s, row }: { s: typeof selectors; row: Row }) {
+  const recipients = (selector: string) => root.querySelector(selector)?.textContent
+    ?.replace(/^\s*(?:to|cc)\s*:\s*/i, "").replace(/\s+/g, " ").trim() || null;
+  const cards = Array.from(root.querySelectorAll(s.attachment));
+  const attachment_names = cards.map((node, index) => {
+    if (node.getAttribute("data-testid") === "attachment-name") return node.textContent?.trim() || "attachment-" + (index + 1);
+    const titled = node.querySelector("[title]")?.getAttribute("title")?.trim();
+    const text = ((node as HTMLElement).innerText ?? "").split("\n")[0].trim();
+    const label = (node.getAttribute("aria-label") ?? "").replace(/\s+Open(?:\s+[\d.,]+\s*[KMGT]?B)?\s*$/i, "").trim();
+    return titled || text || label || "attachment-" + (index + 1);
+  });
+  const attachments = cards.map((node, index) => {
+    const name = attachment_names[index];
+    const sizePattern = /^(?:Size:\s*)?([\d.,]+)\s*(KB|MB|GB|TB|B)$/i;
+    const filename = Array.from(node.querySelectorAll("*")).find(element =>
+      element.getAttribute("title")?.trim() === name || element.textContent?.trim() === name);
+    const sizeText = [node.querySelector('[data-testid="attachment-size"]'), ...node.querySelectorAll("*")]
+      .filter((element): element is Element => !!element && !filename?.contains(element))
+      .map(element => element.textContent?.trim() ?? "")
+      .find(text => text !== name && sizePattern.test(text));
+    const label = node.getAttribute("aria-label") ?? "";
+    const suffix = label.startsWith(name) ? label.slice(name.length).replace(/^\s+Open\s+/i, "").trim() : "";
+    const match = (sizeText ?? suffix).match(sizePattern);
+    const size_bytes = match ? Math.round(Number(match[1].replace(/,/g, "")) * 1024 ** ["B", "KB", "MB", "GB", "TB"].indexOf(match[2].toUpperCase())) : null;
+    const typeNode = node.querySelector('[data-testid="attachment-type"], img[alt]');
+    const type = typeNode?.textContent?.trim() || typeNode?.getAttribute("alt")?.trim() || null;
+    return { index, name, size_bytes, type };
+  });
+  return { subject: row.subject, sender: row.sender, to: recipients(s.recipients.to), cc: recipients(s.recipients.cc), attachment_names, attachments };
+}
+
 const temporaryIdMs = 30 * 60_000;
 /** Upper bound for `search_mail`'s limit. Higher values only help when Outlook will render more rows. */
 export const searchResultLimit = 40;
+
+export async function waitForSurface(page: Page, surface: Locator, timeout: number, checkpoint = () => {}) {
+  const deadline = Date.now() + timeout;
+  do {
+    checkpoint();
+    if (isMicrosoftLogin(page)) return "login" as const;
+    if (await surface.isVisible().catch(() => false)) return "ready" as const;
+    if (page.isClosed()) break;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)));
+  } while (Date.now() < deadline);
+  return "timeout" as const;
+}
 
 const hasKey = (row: Row) => Boolean(JSON.parse(row.fingerprint)[0]);
 
@@ -153,7 +205,12 @@ export class Outlook {
   /** Tabs owned by another read-only surface, such as calendar. Mail must not type into them. */
   private reserved = new Set<Page>();
   private queue = Promise.resolve();
+  private operation = new AsyncLocalStorage<() => void>();
   private references = new Map<string, Reference>();
+
+  checkpoint() {
+    this.operation.getStore()?.();
+  }
 
   status() {
     return {
@@ -183,6 +240,12 @@ export class Outlook {
   private async ensurePage() {
     if (!this.context) {
       const context = await this.launchBrowser();
+      try {
+        this.checkpoint();
+      } catch (error) {
+        await context.close().catch(() => {});
+        throw error;
+      }
       this.context = context;
       context.once("close", () => {
         if (this.context !== context) return;
@@ -195,6 +258,7 @@ export class Outlook {
       // Skip tabs another surface reserved. An empty set keeps the original "first open page" behavior.
       const page = this.context.pages().find(candidate => !candidate.isClosed() && !this.reserved.has(candidate))
         ?? await this.context.newPage();
+      this.checkpoint();
       page.once("crash", () => {
         console.error("outlook-mcp: the Outlook tab crashed. The next request opens a new one.");
         void page.close().catch(() => {});
@@ -248,27 +312,48 @@ export class Outlook {
     return new MailError("BROWSER_ERROR", "Outlook did not respond as expected. Check the browser session and layout.");
   }
 
-  private run<T>(work: (page: Page) => Promise<T>) {
+  private run<T>(work: (page: Page) => Promise<T>, signal?: AbortSignal) {
     if (this.busy) return Promise.reject(this.busyError());
+    const deadline = Date.now() + (this.options.operationMs ?? 180_000);
+    const timeout = new MailError("TIMEOUT", "Outlook operation exceeded its deadline. Try again.");
+    const cancelled = new MailError("CANCELLED", "The request was cancelled.");
+    let expired = false;
+    let running = false;
+    let abort: () => void;
+    const aborted = new Promise<never>((_, reject) => { abort = () => reject(cancelled); });
+    const onAbort = () => abort();
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+    let watchdog: NodeJS.Timeout;
+    const stuck = new Promise<never>((_, reject) => {
+      watchdog = setTimeout(() => { expired = true; reject(timeout); }, Math.max(0, deadline - Date.now()));
+    });
+    const checkpoint = () => {
+      if (expired || Date.now() >= deadline) throw timeout;
+      if (signal?.aborted) throw cancelled;
+    };
     const result = this.queue.then(async () => {
+      checkpoint();
+      running = true;
       if (this.busy) throw this.busyError();
       clearTimeout(this.idleTimer);
-      let watchdog: NodeJS.Timeout | undefined;
+      return this.operation.run(checkpoint, async () => {
       try {
-        const page = await this.ensurePage();
-        const limit = this.options.operationMs ?? 180_000;
-        const stuck = new Promise<never>((_, reject) => {
-          watchdog = setTimeout(() => reject(new MailError("TIMEOUT", "Outlook stopped responding. The browser was reset; try again.")), limit);
-        });
         this.recoveryTried = false;
         const attempt = async () => {
+          const page = await this.ensurePage();
+          checkpoint();
           try {
-            return await work(page);
+            const value = await work(page);
+            checkpoint();
+            return value;
           } catch (error) {
+            checkpoint();
             if (!await this.sessionLost(page, error)) throw error;
             // Microsoft signed the browser out mid-operation. Recover once, then repeat the work.
             console.error("outlook-mcp: the Microsoft session ended during a request; signing back in.");
             await this.ensureMailbox(page, true);
+            checkpoint();
             return await work(page);
           }
         };
@@ -283,12 +368,16 @@ export class Outlook {
         if (failure.code === "BROWSER_RESTARTED" || (failure.code === "TIMEOUT" && error === failure)) await this.shutdownBrowser();
         throw failure;
       } finally {
-        clearTimeout(watchdog);
         this.scheduleIdleClose();
       }
+      });
+    }).finally(() => {
+      clearTimeout(watchdog);
+      signal?.removeEventListener("abort", onAbort);
     });
     this.queue = result.then(() => {}, () => {});
-    return result;
+    const pendingTimeout = stuck.catch(error => running ? new Promise<never>(() => {}) : Promise.reject(error));
+    return Promise.race([result, pendingTimeout, aborted]);
   }
 
   async openSignIn() {
@@ -466,12 +555,13 @@ export class Outlook {
    * Runs read-only work in the signed-in browser after the mailbox session is ready.
    * Serialized with mail on the same queue, with the same auth recovery and error codes.
    */
-  useBrowser<T>(work: (context: BrowserContext) => Promise<T>) {
+  useBrowser<T>(work: (context: BrowserContext) => Promise<T>, signal?: AbortSignal) {
     return this.run(async page => {
       await this.ensureMailbox(page);
       if (!this.context) throw new MailError("BROWSER_ERROR", "The browser is not open.");
+      this.checkpoint();
       return work(this.context);
-    });
+    }, signal);
   }
 
   /**
@@ -514,16 +604,13 @@ export class Outlook {
       let recoveries = 0;
       // Each pass waits for the search box or a sign-in page, then handles whichever appeared.
       for (;;) {
+        this.checkpoint();
         if (isMicrosoftLogin(page)) {
           if (++recoveries > 2) throw new MailError("AUTH_REQUIRED", sessionExpired);
           await this.recoverSession(page);
           if (!outlookOrigins.has(safeOrigin(page.url()))) await load("goto");
         }
-        const outcome = await Promise.race([
-          search.waitFor({ timeout: readyMs }).then(() => "ready" as const, () => "timeout" as const),
-          page.waitForURL(url => signInOrigins.has(safeOrigin(String(url))), { timeout: readyMs, waitUntil: "commit" })
-            .then(() => "login" as const, () => new Promise<never>(() => {})),
-        ]);
+        const outcome = await waitForSurface(page, search, readyMs, () => this.checkpoint());
         if (outcome === "ready" && !isMicrosoftLogin(page)) break;
         if (outcome === "login" || isMicrosoftLogin(page)) continue;
         if (page.url().startsWith("chrome-error:") && !blockedNavigation) {
@@ -557,6 +644,7 @@ export class Outlook {
   }
 
   private async rows(page: Page, query: string): Promise<Row[]> {
+    this.checkpoint();
     const existing = this.lastSearchQuery === query && await this.showingSearch(page, query)
       ? await this.extractRows(this.resultList(page))
       : [];
@@ -565,9 +653,13 @@ export class Outlook {
     const { search, modernSearch } = await this.ensureMailbox(page);
     const modern = await modernSearch.isVisible();
     if (modern) {
-      await modernSearch.click();
-      await modernSearch.press("Control+a");
-      await modernSearch.pressSequentially(query, { delay: 20 });
+      await modernSearch.fill(query);
+      if (await modernSearch.inputValue() !== query) {
+        await modernSearch.click();
+        await modernSearch.press("Control+a");
+        await modernSearch.pressSequentially(query, { delay: 20 });
+      }
+      if (await modernSearch.inputValue() !== query) throw new MailError("UI_CHANGED", "Outlook did not accept the search query.");
     } else {
       await search.fill(query);
     }
@@ -579,6 +671,7 @@ export class Outlook {
       new URL(response.url()).pathname === "/searchservice/api/v2/query" &&
       response.request().method() === "POST" && response.ok(), { timeout: 10000 })
       .then(() => true, () => false) : undefined;
+    this.checkpoint();
     await (modern ? modernSearch : search).press("Enter");
     if (oldRow) {
       try {
@@ -663,13 +756,12 @@ export class Outlook {
       collected.push(...fresh);
       for (const row of list) seen.add(row.fingerprint);
     };
-    if (await this.scrollList(page, "top")) await page.waitForTimeout(250);
+    await this.scrollList(page, "top");
     add(await this.extractRows(this.resultList(page)));
     let stuck = 0;
     for (let step = 0; step < 50 && this.hitsFrom(collected).length < limit; step++) {
       const moved = await this.scrollList(page, "next");
       if (!moved) break;
-      await page.waitForTimeout(250);
       const before = collected.length;
       add(await this.extractRows(this.resultList(page)));
       if (collected.length === before) {
@@ -679,7 +771,7 @@ export class Outlook {
     return collected;
   }
 
-  search(query: string, limit: number) {
+  search(query: string, limit: number, signal?: AbortSignal) {
     return this.run(async page => {
       const rows = await this.gatherRows(page, query, limit);
       const hits = this.hitsFrom(rows);
@@ -695,7 +787,7 @@ export class Outlook {
       }
       const omitted = rows.filter(row => !hits.some(hit => hit.fingerprint === row.fingerprint)).length;
       return { messages, scope: "rendered_search_results", ambiguous_results_omitted: omitted };
-    });
+    }, signal);
   }
 
   private reference(id: string) {
@@ -709,6 +801,7 @@ export class Outlook {
 
   /** Finds the search row for a message ID, verifies it and opens it in the reading pane. */
   private async openMessage(page: Page, reference: Reference) {
+    this.checkpoint();
     if (reference.expires <= Date.now()) {
       throw new MailError("UNKNOWN_MESSAGE", "Run search_mail again to get a fresh message ID.");
     }
@@ -758,20 +851,65 @@ export class Outlook {
       throw new MailError("MESSAGE_CHANGED", "Search results changed before opening the message.");
     }
     const wasUnread = await this.rowWasUnread(candidate);
-    await candidate.locator(selectors.subject).first().click();
+    this.checkpoint();
+    const clicked = await candidate.evaluate(async (node, { s, fingerprint }) => {
+      const text = (selector: string) => node.querySelector(selector)?.textContent?.trim() ?? "";
+      const timeNode = node.querySelector("time");
+      const time = timeNode?.getAttribute("datetime") ?? timeNode?.textContent?.trim()
+        ?? node.querySelector(".qq2gS[title]")?.getAttribute("title") ?? "";
+      let key: string | null = null;
+      for (const name of s.keyAttributes) {
+        const value = node.getAttribute(name) || node.querySelector("[" + name + "]")?.getAttribute(name);
+        if (value) { key = value; break; }
+      }
+      if (JSON.stringify([key, text(s.sender), text(s.subject), time, text(s.preview)]) !== fingerprint) return false;
+      const subject = node.querySelector<HTMLElement>(s.subject);
+      if (!subject || !node.isConnected) return false;
+      let scrollable = node.parentElement;
+      while (scrollable && !(scrollable.scrollHeight > scrollable.clientHeight + 4
+          && /auto|scroll/.test(getComputedStyle(scrollable).overflowY))) scrollable = scrollable.parentElement;
+      const identity = () => scrollable ? JSON.stringify(Array.from(scrollable.querySelectorAll(s.results), row =>
+        [row.getAttribute("data-item-id"), row.getAttribute("data-convid"), row.querySelector(s.subject)?.textContent])) : "";
+      const before = scrollable?.scrollTop;
+      const windowBefore = identity();
+      subject.click();
+      if (scrollable && scrollable.scrollTop !== before && identity() === windowBefore) {
+        await new Promise<void>(resolve => {
+          let frame = 0;
+          const finish = () => { clearTimeout(timer); cancelAnimationFrame(frame); resolve(); };
+          const check = () => { if (identity() !== windowBefore) finish(); else frame = requestAnimationFrame(check); };
+          const timer = setTimeout(finish, 250);
+          check();
+        });
+      }
+      return true;
+    }, { s: selectors, fingerprint: row.fingerprint });
+    if (!clicked) throw new MailError("MESSAGE_CHANGED", "Search results changed before opening the message.");
     return { row, wasUnread };
   }
 
   // Moves the list's scroll container: "top" resets it, "next" advances most of a screen. Returns false at the end.
   private scrollList(page: Page, step: "top" | "next") {
-    return searchRegion(page).evaluate((root, step) => {
+    this.checkpoint();
+    return searchRegion(page).evaluate(async (root, { step, results }) => {
       const scrollable = [root, ...root.querySelectorAll("*")].find(element =>
         element.scrollHeight > element.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(element).overflowY));
       if (!scrollable) return false;
+      const identity = () => JSON.stringify(Array.from(root.querySelectorAll(results)).map(node =>
+        [node.getAttribute("data-item-id"), node.getAttribute("data-convid"), node.id, node.textContent]));
+      const windowBefore = identity();
       const before = scrollable.scrollTop;
       scrollable.scrollTop = step === "top" ? 0 : before + scrollable.clientHeight * 0.8;
-      return step === "top" ? before !== 0 : scrollable.scrollTop !== before;
-    }, step).catch(() => false);
+      if (scrollable.scrollTop === before) return false;
+      await new Promise<void>(resolve => {
+        let frame = 0;
+        const finish = () => { clearTimeout(timer); cancelAnimationFrame(frame); resolve(); };
+        const check = () => { if (identity() !== windowBefore) finish(); else frame = requestAnimationFrame(check); };
+        const timer = setTimeout(finish, 250);
+        check();
+      });
+      return true;
+    }, { step, results: selectors.results }).catch(() => false);
   }
 
   /**
@@ -782,12 +920,11 @@ export class Outlook {
     const visibleRows = () => this.resultList(page);
     let matches = find(await this.extractRows(visibleRows()));
     if (matches.length) return matches;
-    let moved = await this.scrollList(page, "top");
+    await this.scrollList(page, "top");
     for (let steps = 0; steps < 25; steps++) {
-      if (moved) await page.waitForTimeout(250);
       matches = find(await this.extractRows(visibleRows()));
       if (matches.length) return matches;
-      moved = await this.scrollList(page, "next");
+      const moved = await this.scrollList(page, "next");
       if (!moved) break;
     }
     return matches;
@@ -834,36 +971,49 @@ export class Outlook {
     }).first();
   }
 
-  /** One name per attachment card, in card order, so an index always selects the same card. */
-  private attachmentNames(pane: Locator) {
-    return pane.locator(selectors.attachment).evaluateAll(nodes => nodes.map((node, index) => {
-      if (node.getAttribute("data-testid") === "attachment-name") return (node.textContent ?? "").trim() || "attachment-" + (index + 1);
-      // File cards have a titled name. Image cards show a thumbnail, so fall back to the card's label,
-      // which reads like "photo.jpg Open 2 MB".
-      const titled = node.querySelector("[title]")?.getAttribute("title")?.trim();
-      const text = ((node as HTMLElement).innerText ?? "").split("\n")[0].trim();
-      const label = (node.getAttribute("aria-label") ?? "").replace(/\s+Open(?:\s+[\d.,]+\s*[KMGT]?B)?\s*$/i, "").trim();
-      return titled || text || label || "attachment-" + (index + 1);
-    }));
+  async read(id: string, maxBodyChars = 12000, signal?: AbortSignal) {
+    const reference = this.reference(id);
+    return this.run(page => this.readOnPage(page, reference, id, maxBodyChars), signal);
   }
 
-  async read(id: string) {
-    const reference = this.reference(id);
+  readMails(ids: string[], maxBodyChars = 12000, signal?: AbortSignal) {
+    if (!ids.length || ids.length > 10) throw new MailError("INVALID_RANGE", "Pass 1 to 10 message IDs.");
     return this.run(async page => {
+      const results = [];
+      for (const message_id of ids) {
+        this.checkpoint();
+        try {
+          results.push({ message_id, data: await this.readOnPage(page, this.reference(message_id), message_id, maxBodyChars) });
+        } catch (error) {
+          this.checkpoint();
+          if (await this.sessionLost(page, error)) throw error;
+          results.push({ message_id, error: errorInfo(this.classify(error)) });
+        }
+      }
+      return { results };
+    }, signal);
+  }
+
+  private async readOnPage(page: Page, reference: Reference, id: string, maxBodyChars: number) {
+      if (!Number.isInteger(maxBodyChars) || maxBodyChars < 1 || maxBodyChars > 12000) {
+        throw new MailError("INVALID_RANGE", "max_body_chars must be an integer from 1 to 12000.");
+      }
+      this.checkpoint();
       const opened = await this.openMessage(page, reference);
       try {
-        return await this.extract(page, opened.row, id);
+        this.checkpoint();
+        return await this.extract(page, opened.row, id, maxBodyChars);
       } finally {
         if (opened.wasUnread) await this.restoreUnread(page);
       }
-    });
   }
 
   /**
-   * Downloads one attachment of a message through Outlook's own Download command and returns its bytes.
+   * Downloads through Outlook's own command; consume must finish before the temporary file is deleted.
    * `attachment` is a zero-based index into attachment_names or an exact file name.
    */
-  async downloadAttachment(id: string, attachment: number | string, maxBytes: number) {
+  async downloadAttachment<T extends Record<string, unknown>>(id: string, attachment: number | string, maxBytes: number,
+    consume: (file: { path: string; name: string; size_bytes: number; head: Buffer }) => Promise<T>, signal?: AbortSignal) {
     const reference = this.reference(id);
     return this.run(async page => {
       const opened = await this.openMessage(page, reference);
@@ -873,7 +1023,8 @@ export class Outlook {
         await pane.locator(selectors.attachment).first().waitFor({ timeout: 8000 }).catch(() => {
           throw new MailError("NO_ATTACHMENTS", "This message has no downloadable attachments.");
         });
-        const names = await this.attachmentNames(pane);
+        const metadata = await pane.evaluate(mailMetadata, { s: selectors, row });
+        const names = metadata.attachment_names;
         let index: number;
         if (typeof attachment === "number") {
           index = attachment;
@@ -887,6 +1038,9 @@ export class Outlook {
           throw new MailError("UNKNOWN_ATTACHMENT", "No such attachment. Available: " + JSON.stringify(names));
         }
         const card = pane.locator(selectors.attachment).nth(index);
+        const visibleSize = metadata.attachments[index].size_bytes;
+        if (visibleSize !== null && visibleSize > maxBytes) throw new MailError("ATTACHMENT_TOO_LARGE", "The visible attachment size exceeds the configured limit.");
+        this.checkpoint();
         await card.hover().catch(() => {});
         const menu = card.locator(selectors.attachmentMenu).first();
         if (!await menu.count()) throw new MailError("ATTACHMENT_UNAVAILABLE", "Outlook offers no download for this attachment.");
@@ -907,6 +1061,7 @@ export class Outlook {
         const item = items.nth(position);
         const [download] = await Promise.all([page.waitForEvent("download", { timeout: 60_000 }), item.click()]);
         try {
+          this.checkpoint();
           if (await download.failure()) throw new MailError("DOWNLOAD_FAILED", "Outlook could not download the attachment.");
           const path = await download.path();
           const { size } = await stat(path);
@@ -914,53 +1069,117 @@ export class Outlook {
             throw new MailError("ATTACHMENT_TOO_LARGE", "The attachment is " + Math.ceil(size / 1048576) + " MB, over the " +
               Math.floor(maxBytes / 1048576) + " MB limit.");
           }
-          return { message_id: id, name: names[index] || download.suggestedFilename(), size_bytes: size, data: await readFile(path) };
+          this.checkpoint();
+          const name = names[index] || download.suggestedFilename();
+          const fd = await open(path, "r");
+          const head = Buffer.alloc(Math.min(size, 8192));
+          try { await fd.read(head, 0, head.length, 0); } finally { await fd.close(); }
+          const payload = await consume({ path, name, size_bytes: size, head });
+          return { message_id: id, name, size_bytes: size, ...payload };
         } finally {
           await download.delete().catch(() => {});
         }
       } finally {
         if (opened.wasUnread) await this.restoreUnread(page);
       }
-    });
+    }, signal);
   }
 
-  private async extract(page: Page, row: Row, id: string) {
+  private async extract(page: Page, row: Row, id: string, maxBodyChars: number) {
+    this.checkpoint();
     const pane = this.pane(page, row);
-    const findBody = async (visible: boolean) => {
+    await pane.waitFor({ state: "visible" });
+    const findBody = async () => {
       for (const selector of selectors.body) {
-        const candidate = visible ? pane.locator(selector).filter({ visible: true }) : pane.locator(selector);
-        if (await candidate.count()) return candidate;
+        const present = pane.locator(selector);
+        if (await present.evaluateAll(nodes => nodes.some(node => {
+          for (let current: Element | null = node; current; current = current.parentElement) {
+            const style = getComputedStyle(current);
+            if (current.hasAttribute("hidden") || current.getAttribute("aria-hidden") === "true"
+                || style.display === "none" || style.visibility === "hidden") return false;
+          }
+          return true;
+        }))) return present;
       }
     };
     let bodies: Locator | undefined;
     const started = Date.now();
     while (!bodies && Date.now() - started < 8000) {
-      bodies = await findBody(true);
-      // An empty or image-only body has no size, so Playwright never counts it as visible.
-      if (!bodies && Date.now() - started > 2000) bodies = await findBody(false);
+      this.checkpoint();
+      bodies = await findBody();
       if (!bodies) await page.waitForTimeout(150);
     }
     if (!bodies) throw new MailError("UI_CHANGED", "Could not find the message body in the reading pane.");
     // Outermost bodies only. A conversation shows one body per expanded message.
-    const parts = await bodies.evaluateAll(nodes => {
-      const roots = nodes.filter(node => !nodes.some(other => other !== node && other.contains(node)));
+    const extracted = await bodies.evaluateAll((nodes, maxBodyChars) => {
+      const eligible = nodes.filter(node => {
+        for (let current: Element | null = node; current; current = current.parentElement) {
+          const style = getComputedStyle(current);
+          if (current.hasAttribute("hidden") || current.getAttribute("aria-hidden") === "true"
+              || style.display === "none" || style.visibility === "hidden") return false;
+        }
+        return true;
+      });
+      const roots = eligible.filter(node => !eligible.some(other => other !== node && other.contains(node)));
       const parts: BodyPart[] = [];
-      roots.forEach((root, index) => {
-        if (index) parts.push({ kind: "separator", text: "" });
+      let committed = 0;
+      let separator = false;
+      let truncated = false;
+      for (const [index, root] of roots.entries()) {
+        if (truncated) break;
+        if (index) separator = true;
         let buffer = "";
+        let buffered = 0;
+        let whitespace = "";
+        const overhead = () => parts.length ? separator ? 7 : 2 : 0;
+        const append = (text: string) => {
+          const budget = Math.max(1, maxBodyChars + 1 - committed - overhead());
+          for (const char of text) {
+            if (char === " ") {
+              if (buffer && !whitespace.includes("\n")) whitespace = " ";
+              continue;
+            }
+            if (char === "\n") {
+              if (buffer) whitespace = whitespace.includes("\n") ? "\n\n" : "\n";
+              continue;
+            }
+            if (buffered >= budget) { truncated = true; break; }
+            buffer += whitespace + char;
+            buffered += whitespace.length + 1;
+            whitespace = "";
+            if (buffered > budget) { truncated = true; break; }
+          }
+        };
         const flush = (kind: BodyPart["kind"]) => {
-          if (buffer.trim()) parts.push({ kind, text: buffer });
+          if (buffer) {
+            committed += overhead();
+            if (separator && parts.length) parts.push({ kind: "separator", text: "" });
+            separator = false;
+            parts.push({ kind, text: buffer });
+            const clean = buffer.split("\n").map(line => line.replace(/[ \t ]+/g, " ").trim()).join("\n")
+              .replace(/\n{3,}/g, "\n\n").trim();
+            const safe = clean.replace(/[\\`\[\]<>]/g, "\\$&")
+              .replace(/^(\s*)(#{1,6}|[-+*]|\d+[.)])(?=\s)/gm, "$1\\$2")
+              .replace(/^(\s*)(={3,}|-{3,}|_{3,}|\*{3,})\s*$/gm, "$1\\$2");
+            const rendered = kind === "bullet" ? "- " + safe.replace(/\n/g, "\n  ")
+              : kind === "quote" ? safe.split("\n").map(line => "> " + line).join("\n") : safe;
+            committed += Array.from(rendered).length;
+            if (committed > maxBodyChars) truncated = true;
+          }
           buffer = "";
+          buffered = 0;
+          whitespace = "";
         };
         const walk = (node: Node, kind: BodyPart["kind"]) => {
           for (const child of node.childNodes) {
+            if (truncated) break;
             if (child.nodeType === Node.TEXT_NODE) {
-              buffer += (child.textContent ?? "").replace(/\s+/g, " ");
+              append((child.textContent ?? "").replace(/\s+/g, " "));
               continue;
             }
             if (child instanceof HTMLImageElement) {
               const alt = child.alt.replace(/\s+/g, " ").trim();
-              if (alt.length > 1 && !child.hidden) buffer += " (image: " + alt + ") ";
+              if (alt.length > 1 && !child.hidden) append(" (image: " + alt + ") ");
               continue;
             }
             if (!(child instanceof HTMLElement) || child.hidden || child.getAttribute("aria-hidden") === "true" ||
@@ -968,40 +1187,43 @@ export class Outlook {
             const style = getComputedStyle(child);
             if (style.display === "none" || style.visibility === "hidden") continue;
             if (child.tagName === "BR") {
-              buffer += "\n";
+              append("\n");
               continue;
             }
             // Data tables become "a | b" rows. Layout tables (one cell or nested tables) are walked normally.
             if (child instanceof HTMLTableRowElement && child.cells.length > 1 && !child.querySelector("table")) {
               flush(kind);
-              const cells = Array.from(child.cells, cell => cell.innerText.replace(/\s+/g, " ").trim()).filter(Boolean);
-              if (cells.length) parts.push({ kind: "row", text: cells.join(" | ") });
+              for (const cell of child.cells) {
+                const value = cell.innerText.replace(/\s+/g, " ").trim();
+                if (value) append((buffer ? " | " : "") + value);
+                if (truncated) break;
+              }
+              flush("row");
               continue;
             }
             const block = !style.display.startsWith("inline");
             const inner = child.tagName === "LI" ? "bullet" : child.tagName === "BLOCKQUOTE" ? "quote"
               : child.tagName === "HR" ? "separator" : kind;
             if (block) flush(kind);
-            if (inner === "separator" && kind !== "separator") parts.push({ kind: "separator", text: "" });
+            if (inner === "separator" && kind !== "separator") {
+              separator = true;
+            }
             else walk(child, inner);
             if (block) flush(inner);
           }
         };
         walk(root, "paragraph");
         flush("paragraph");
-      });
-      return parts;
-    });
+      }
+      return { parts, truncated };
+    }, maxBodyChars);
     // Attachment cards can render after the body. Wait for them only when the row says there are some.
     if (row.hasAttachments) await pane.locator(selectors.attachment).first().waitFor({ timeout: 8000 }).catch(() => {});
-    const attachments = await this.attachmentNames(pane);
-    const recipients = async (selector: string) => {
-      const text = await pane.locator(selector).first().textContent({ timeout: 250 }).catch(() => null);
-      return text?.replace(/^\s*(?:to|cc)\s*:\s*/i, "").replace(/\s+/g, " ").trim() || null;
-    };
-    return { message_id: id, subject: row.subject, sender: row.sender, received_at: row.time || null,
-      to: await recipients(selectors.recipients.to), cc: await recipients(selectors.recipients.cc),
-      attachment_names: attachments, ...formatBody(parts) };
+    this.checkpoint();
+    const metadata = await pane.evaluate(mailMetadata, { s: selectors, row });
+    const body = formatBody(extracted.parts, maxBodyChars);
+    return { message_id: id, ...metadata, received_at: row.time || null,
+      ...body, truncated: body.truncated || extracted.truncated };
   }
 
   async close() {

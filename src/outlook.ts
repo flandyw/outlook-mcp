@@ -850,11 +850,11 @@ export class Outlook {
       const { rows, scan_limit_reached } = await this.gatherRows(page, "", Infinity, folder);
       const identifiable = this.hitsFrom(rows);
       const hits = identifiable.filter(row => !unreadOnly || row.unread);
-      hits.sort((a, b) => {
-        const left = Date.parse(a.time), right = Date.parse(b.time);
-        return Number.isFinite(left) && Number.isFinite(right) ? right - left : 0;
-      });
-      const messages = hits.slice(0, limit).map(row => {
+      const dated = hits.filter(row => Number.isFinite(Date.parse(row.time)));
+      dated.sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+      let dateIndex = 0;
+      const ordered = hits.map(row => Number.isFinite(Date.parse(row.time)) ? dated[dateIndex++] : row);
+      const messages = ordered.slice(0, limit).map(row => {
         const message_id = durableMessageId("", row, folder) ?? randomUUID();
         this.references.set(message_id, { query: "", folder, row, expires: Date.now() + (this.options.referenceTtlMs ?? temporaryIdMs) });
         return { message_id, sender: row.sender, subject: row.subject, received_at: row.time || null,

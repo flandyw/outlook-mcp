@@ -141,3 +141,23 @@ test("re-finds rows from the final listing window for reads, batches and attachm
   const attachment = await restarted.downloadAttachment(id, 0, 1024, async file => ({ text: await readFile(file.path, "utf8") }));
   assert.equal(attachment.text, "deep");
 });
+
+test("mixed dates sort dated slots consistently while preserving unknown positions and equal-date order", async t => {
+  const browser = await launchChromium();
+  t.after(() => browser.close());
+  const context = await browser.newContext();
+  let dates = ["2026-11-10", "Yesterday", "2026-11-12", "", "2026-11-11", "Today", "2026-11-12"];
+  await context.route("https://outlook.office.com/**", route => route.fulfill({ contentType: "text/html", body: `
+    <input type="search" aria-label="Search"><div id="MailList"><div role="listbox">
+    ${dates.map((date, index) => `<div role="option" data-item-id="row-${index}">
+      <span data-testid="sender">Ada</span><span data-testid="subject">Row ${index}</span>
+      <time datetime="${date}"></time></div>`).join("")}</div></div>` }));
+  const outlook = new Outlook(async () => context);
+  const subjects = async limit => (await outlook.list("inbox", limit)).messages.map(row => row.subject);
+  assert.deepEqual(await subjects(10), [2, 1, 6, 3, 4, 5, 0].map(index => "Row " + index));
+  assert.deepEqual(await subjects(2), ["Row 2", "Row 1"], "apply limit after consistently ordering the dated slots");
+  dates = ["Today", "2026-11-10", "Yesterday", "2026-11-12"];
+  assert.deepEqual(await subjects(2), ["Row 0", "Row 3"], "a fresh relative-date row keeps its leading position");
+  dates = ["Today", "Yesterday", ""];
+  assert.deepEqual(await subjects(10), ["Row 0", "Row 1", "Row 2"]);
+});

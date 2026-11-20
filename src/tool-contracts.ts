@@ -33,8 +33,8 @@ export const toolContracts = {
   list_mail: {
     title: "List live Outlook folder mail",
     description: "List newest rendered folder rows directly, without the delayed search index. Clears active search by navigating to a well-known folder. " +
-      "Scans at most 50 scroll windows; scan_limit_reached and truncated disclose incomplete output. Sorts parseable received_at dates newest first, " +
-      "otherwise retains Outlook's list order. Rows may be conversations. IDs work with mail reads/attachments; drafts are list-only to avoid opening the composer.",
+      "Scans at most 50 scroll windows; scan_limit_reached and truncated disclose incomplete output. Sorts parseable received_at dates newest first " +
+      "within the dated slots; unparseable dates keep their original list positions. Rows may be conversations. IDs work with mail reads/attachments; drafts are list-only to avoid opening the composer.",
     inputSchema: { folder: z.enum(mailFolders).default("inbox").describe("Well-known folder: inbox (default), sentitems, drafts, archive, junkemail, deleteditems."),
       limit: z.number().int().min(1).max(searchResultLimit).default(10).describe("Maximum identifiable rows, 1–40 (default 10)."),
       unread_only: z.boolean().default(false).describe("Only rows with Outlook's visible unread prefix/badge; does not change the folder filter.") },

@@ -185,6 +185,27 @@ test("reads the real body, recipients and attachments from the modern layout", a
   assert.equal((await fetch(cancelledLink.download_url)).status, 404);
   const replacement = await downloads.save("replacement", Buffer.from("123456789"), "text/plain");
   assert.equal(await (await fetch(replacement.download_url)).text(), "123456789", "cancelled unserved attachments must release the byte budget");
+  const page = context.pages()[0];
+  await page.locator('[aria-label="file attachments"] [role="option"]').nth(0).evaluate(node => {
+    node.setAttribute("aria-label", "50 MB upload limit.pdf Open 1 KB");
+    node.querySelector("[title]").setAttribute("title", "50 MB upload limit.pdf");
+    node.querySelector("[title]").innerHTML = "<span>50 MB</span> upload limit.pdf";
+    node.querySelectorAll("div")[1].textContent = "1 KB";
+    node.querySelector("button").dataset.file = "50 MB upload limit.pdf";
+  });
+  assert.equal((await outlook.read(id)).attachments[0].size_bytes, 1024);
+  const small = await outlook.downloadAttachment(id, "50 MB upload limit.pdf", 1024, consume);
+  assert.equal(small.data.toString(), "Plan body");
+  await page.locator('[aria-label="file attachments"] [role="option"]').nth(0).evaluate(node => {
+    node.setAttribute("aria-label", "50 MB upload limit.pdf Open");
+    node.querySelectorAll("div")[1].remove();
+  });
+  assert.equal((await outlook.read(id)).attachments[0].size_bytes, null, "filename alone is not a visible size");
+  assert.equal((await outlook.downloadAttachment(id, 0, 1024, consume)).size_bytes, 9);
+  await page.locator('[aria-label="file attachments"] [role="option"]').nth(0).evaluate(node => {
+    node.setAttribute("aria-label", "50 MB upload limit.pdf Open 40 MB");
+  });
+  await assert.rejects(outlook.downloadAttachment(id, 0, 1024, consume), { code: "ATTACHMENT_TOO_LARGE" });
 });
 
 // Outlook paints only the rows near the viewport (here, 4 of 30). Search scrolls for more, and opening

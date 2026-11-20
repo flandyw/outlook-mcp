@@ -50,6 +50,37 @@ const selectors = {
   keyAttributes: ["data-item-id", "data-convid"],
 };
 
+function mailMetadata(root: Element, { s, row }: { s: typeof selectors; row: Row }) {
+  const recipients = (selector: string) => root.querySelector(selector)?.textContent
+    ?.replace(/^\s*(?:to|cc)\s*:\s*/i, "").replace(/\s+/g, " ").trim() || null;
+  const cards = Array.from(root.querySelectorAll(s.attachment));
+  const attachment_names = cards.map((node, index) => {
+    if (node.getAttribute("data-testid") === "attachment-name") return node.textContent?.trim() || "attachment-" + (index + 1);
+    const titled = node.querySelector("[title]")?.getAttribute("title")?.trim();
+    const text = ((node as HTMLElement).innerText ?? "").split("\n")[0].trim();
+    const label = (node.getAttribute("aria-label") ?? "").replace(/\s+Open(?:\s+[\d.,]+\s*[KMGT]?B)?\s*$/i, "").trim();
+    return titled || text || label || "attachment-" + (index + 1);
+  });
+  const attachments = cards.map((node, index) => {
+    const name = attachment_names[index];
+    const sizePattern = /^(?:Size:\s*)?([\d.,]+)\s*(KB|MB|GB|TB|B)$/i;
+    const filename = Array.from(node.querySelectorAll("*")).find(element =>
+      element.getAttribute("title")?.trim() === name || element.textContent?.trim() === name);
+    const sizeText = [node.querySelector('[data-testid="attachment-size"]'), ...node.querySelectorAll("*")]
+      .filter((element): element is Element => !!element && !filename?.contains(element))
+      .map(element => element.textContent?.trim() ?? "")
+      .find(text => text !== name && sizePattern.test(text));
+    const label = node.getAttribute("aria-label") ?? "";
+    const suffix = label.startsWith(name) ? label.slice(name.length).replace(/^\s+Open\s+/i, "").trim() : "";
+    const match = (sizeText ?? suffix).match(sizePattern);
+    const size_bytes = match ? Math.round(Number(match[1].replace(/,/g, "")) * 1024 ** ["B", "KB", "MB", "GB", "TB"].indexOf(match[2].toUpperCase())) : null;
+    const typeNode = node.querySelector('[data-testid="attachment-type"], img[alt]');
+    const type = typeNode?.textContent?.trim() || typeNode?.getAttribute("alt")?.trim() || null;
+    return { index, name, size_bytes, type };
+  });
+  return { subject: row.subject, sender: row.sender, to: recipients(s.recipients.to), cc: recipients(s.recipients.cc), attachment_names, attachments };
+}
+
 const temporaryIdMs = 30 * 60_000;
 /** Upper bound for `search_mail`'s limit. Higher values only help when Outlook will render more rows. */
 export const searchResultLimit = 40;
@@ -940,19 +971,6 @@ export class Outlook {
     }).first();
   }
 
-  /** One name per attachment card, in card order, so an index always selects the same card. */
-  private attachmentNames(pane: Locator) {
-    return pane.locator(selectors.attachment).evaluateAll(nodes => nodes.map((node, index) => {
-      if (node.getAttribute("data-testid") === "attachment-name") return (node.textContent ?? "").trim() || "attachment-" + (index + 1);
-      // File cards have a titled name. Image cards show a thumbnail, so fall back to the card's label,
-      // which reads like "photo.jpg Open 2 MB".
-      const titled = node.querySelector("[title]")?.getAttribute("title")?.trim();
-      const text = ((node as HTMLElement).innerText ?? "").split("\n")[0].trim();
-      const label = (node.getAttribute("aria-label") ?? "").replace(/\s+Open(?:\s+[\d.,]+\s*[KMGT]?B)?\s*$/i, "").trim();
-      return titled || text || label || "attachment-" + (index + 1);
-    }));
-  }
-
   async read(id: string, maxBodyChars = 12000, signal?: AbortSignal) {
     const reference = this.reference(id);
     return this.run(page => this.readOnPage(page, reference, id, maxBodyChars), signal);
@@ -1005,7 +1023,8 @@ export class Outlook {
         await pane.locator(selectors.attachment).first().waitFor({ timeout: 8000 }).catch(() => {
           throw new MailError("NO_ATTACHMENTS", "This message has no downloadable attachments.");
         });
-        const names = await this.attachmentNames(pane);
+        const metadata = await pane.evaluate(mailMetadata, { s: selectors, row });
+        const names = metadata.attachment_names;
         let index: number;
         if (typeof attachment === "number") {
           index = attachment;
@@ -1019,13 +1038,8 @@ export class Outlook {
           throw new MailError("UNKNOWN_ATTACHMENT", "No such attachment. Available: " + JSON.stringify(names));
         }
         const card = pane.locator(selectors.attachment).nth(index);
-        const visibleSize = await card.evaluate(node => (node.textContent ?? "") + " " + (node.getAttribute("aria-label") ?? ""));
-        const sizeMatch = visibleSize.match(/(?:^|\s)([\d.,]+)\s*(KB|MB|GB|TB|B)(?:\s|$)/i);
-        if (sizeMatch) {
-          const units = ["B", "KB", "MB", "GB", "TB"];
-          const bytes = Number(sizeMatch[1].replace(/,/g, "")) * 1024 ** units.indexOf(sizeMatch[2].toUpperCase());
-          if (bytes > maxBytes) throw new MailError("ATTACHMENT_TOO_LARGE", "The visible attachment size exceeds the configured limit.");
-        }
+        const visibleSize = metadata.attachments[index].size_bytes;
+        if (visibleSize !== null && visibleSize > maxBytes) throw new MailError("ATTACHMENT_TOO_LARGE", "The visible attachment size exceeds the configured limit.");
         this.checkpoint();
         await card.hover().catch(() => {});
         const menu = card.locator(selectors.attachmentMenu).first();
@@ -1191,28 +1205,7 @@ export class Outlook {
     // Attachment cards can render after the body. Wait for them only when the row says there are some.
     if (row.hasAttachments) await pane.locator(selectors.attachment).first().waitFor({ timeout: 8000 }).catch(() => {});
     this.checkpoint();
-    const metadata = await pane.evaluate((root, { s, row }) => {
-      const recipients = (selector: string) => root.querySelector(selector)?.textContent
-        ?.replace(/^\s*(?:to|cc)\s*:\s*/i, "").replace(/\s+/g, " ").trim() || null;
-      const attachment_names = Array.from(root.querySelectorAll(s.attachment), (node, index) => {
-        if (node.getAttribute("data-testid") === "attachment-name") return node.textContent?.trim() || "attachment-" + (index + 1);
-        const titled = node.querySelector("[title]")?.getAttribute("title")?.trim();
-        const text = ((node as HTMLElement).innerText ?? "").split("\n")[0].trim();
-        const label = (node.getAttribute("aria-label") ?? "").replace(/\s+Open(?:\s+[\d.,]+\s*[KMGT]?B)?\s*$/i, "").trim();
-        return titled || text || label || "attachment-" + (index + 1);
-      });
-      const cards = root.querySelectorAll(s.attachment);
-      const attachments = attachment_names.map((name, index) => {
-        const node = cards[index];
-        const text = (node?.textContent ?? "") + " " + (node?.getAttribute("aria-label") ?? "");
-        const match = text.match(/(?:^|\s)([\d.,]+)\s*(KB|MB|GB|TB|B)(?:\s|$)/i);
-        const size_bytes = match ? Math.round(Number(match[1].replace(/,/g, "")) * 1024 ** ["B", "KB", "MB", "GB", "TB"].indexOf(match[2].toUpperCase())) : null;
-        const typeNode = node?.querySelector('[data-testid="attachment-type"], img[alt]');
-        const type = typeNode?.textContent?.trim() || typeNode?.getAttribute("alt")?.trim() || null;
-        return { index, name, size_bytes, type };
-      });
-      return { subject: row.subject, sender: row.sender, to: recipients(s.recipients.to), cc: recipients(s.recipients.cc), attachment_names, attachments };
-    }, { s: selectors, row });
+    const metadata = await pane.evaluate(mailMetadata, { s: selectors, row });
     const body = formatBody(extracted.parts, maxBodyChars);
     return { message_id: id, ...metadata, received_at: row.time || null,
       ...body, truncated: body.truncated || extracted.truncated };

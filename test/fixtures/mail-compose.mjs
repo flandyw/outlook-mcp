@@ -9,7 +9,22 @@ export function composeFixture(options = {}) {
       window.fixture = { opens: 0, sends: 0, discards: 0, closed: 0, saved: [], modes: [], restored: 0 };
       const state = window.fixture;
       document.querySelector('#unread').onclick = () => state.restored++;
-      document.querySelector('[role="option"]').onclick = () => document.querySelector('section').hidden = false;
+      document.querySelector('[role="option"]').onclick = () => {
+        document.querySelector('section').hidden = false;
+        if (options.replyDelay) setTimeout(() => {
+          document.querySelector('#reply').hidden = false;
+          document.querySelector('#all').hidden = false;
+          if (options.ambiguousReply) {
+            const duplicate = document.querySelector('#reply').cloneNode(true);
+            duplicate.onclick = () => state.sends++;
+            document.querySelector('section').append(duplicate);
+          }
+        }, options.replyDelay);
+      };
+      if (options.replyDelay) {
+        document.querySelector('#reply').hidden = true;
+        document.querySelector('#all').hidden = true;
+      }
       function compose(mode) {
         state.opens++;
         state.modes.push(mode);

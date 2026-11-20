@@ -1149,11 +1149,14 @@ export class Outlook {
       try {
         if (reference) opened = await this.openMessage(page, reference);
         this.checkpoint();
+        const command = reference
+          ? this.pane(page, opened!.row).getByRole("button", { name: draft.reply_mode === "reply_all" ? /^Reply all$/i : /^Reply$/i }).filter({ visible: true })
+          : page.getByRole("button", { name: /^New (?:mail|message)$/i }).filter({ visible: true });
+        if (reference) await wait(async () => await command.count() > 0,
+          "DRAFT_UNCERTAIN", "The reply control did not become visible; no composer was opened.");
         this.preventRetry();
         attempted = true;
-        await this.draftClick(reference
-          ? this.pane(page, opened!.row).getByRole("button", { name: draft.reply_mode === "reply_all" ? /^Reply all$/i : /^Reply$/i }).filter({ visible: true })
-          : page.getByRole("button", { name: /^New (?:mail|message)$/i }).filter({ visible: true }));
+        await this.draftClick(command);
         await editor.waitFor({ state: "visible", timeout: 5000 });
         this.checkpoint();
         const prefilledTo = await recipients("To");

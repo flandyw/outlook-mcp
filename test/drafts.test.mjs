@@ -65,6 +65,41 @@ test("autosave must produce a fresh saved indication", async t => {
   assert.equal((await state()).sends, 0);
 });
 
+test("reply and reply-all wait for asynchronously rendered controls before the guarded click", async t => {
+  for (const reply_mode of ["reply", "reply_all"]) {
+    const { outlook, state, id } = await fixture(t, { replyDelay: 500, unread: true });
+    const result = await outlook.createDraft({ to: [], body: "Delayed reply", reply_to_message_id: id, reply_mode });
+    assert.equal(result.draft, true);
+    const observed = await state();
+    assert.deepEqual(observed.modes, [reply_mode]);
+    assert.equal(observed.opens, 1);
+    assert.equal(observed.saved.length, 1);
+    assert.equal(observed.restored, 1);
+    assert.equal(observed.sends, 0);
+  }
+});
+
+test("delayed ambiguous reply controls are rejected without opening a composer or clicking Send", async t => {
+  const { outlook, state, id } = await fixture(t, { replyDelay: 500, ambiguousReply: true });
+  await assert.rejects(outlook.createDraft({ to: [], body: "", reply_to_message_id: id }), { code: "DRAFT_UNCERTAIN" });
+  assert.equal((await state()).opens, 0);
+  assert.equal((await state()).sends, 0);
+});
+
+test("waiting for reply controls respects cancellation and never opens a composer", async t => {
+  const { outlook, page, state, id } = await fixture(t, { replyDelay: 10000, unread: true });
+  const controller = new AbortController();
+  const pending = outlook.createDraft({ to: [], body: "", reply_to_message_id: id }, controller.signal);
+  const rejected = assert.rejects(pending, { code: "CANCELLED" });
+  await page.getByRole("heading", { name: "Original", exact: true }).waitFor({ state: "visible" });
+  controller.abort();
+  await rejected;
+  await outlook.useBrowser(async () => {});
+  assert.equal((await state()).opens, 0);
+  assert.equal((await state()).restored, 1);
+  assert.equal((await state()).sends, 0);
+});
+
 test("unresolved recipients fail clearly and discard without opening a second composer", async t => {
   const { outlook, state } = await fixture(t, { unresolved: true });
   await assert.rejects(outlook.createDraft(input), { code: "DRAFT_RECIPIENT_UNRESOLVED" });

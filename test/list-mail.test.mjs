@@ -94,3 +94,50 @@ test("lists live folders without search and reopens virtualized folder IDs acros
   await assert.rejects(outlook.list(), { code: "UI_CHANGED" });
   for (const args of [["../calendar", 1], ["inbox", 0], ["inbox", 41]]) assert.throws(() => outlook.list(...args), { code: "INVALID_RANGE" });
 });
+
+test("re-finds rows from the final listing window for reads, batches and attachments after navigation", async t => {
+  const browser = await launchChromium();
+  t.after(() => browser.close());
+  const context = await browser.newContext();
+  await context.route("https://outlook.office.com/**", route => route.fulfill({ contentType: "text/html", body: `
+    <input type="search" aria-label="Search">
+    <div id="MailList"><div id="scroll" style="height:100px;overflow:auto;position:relative">
+      <div id="rows" role="listbox" style="height:4200px"></div></div></div>
+    <section aria-label="Reading Pane" hidden><h2></h2><div role="document">Deep body</div>
+      <div role="listbox" aria-label="file attachments"><div role="option" aria-label="deep.txt Open">
+        <span title="deep.txt">deep.txt</span><button aria-haspopup="true">More</button></div></div></section>
+    <div role="menu" hidden><button role="menuitem">Download</button></div>
+    <script>
+    const scroll=document.querySelector('#scroll'), rows=document.querySelector('#rows');
+    function render() {
+      const n=Math.floor(scroll.scrollTop/80);
+      rows.innerHTML='<div role="option" data-item-id="deep-'+n+'" style="position:absolute;top:'+n*80+'px;height:100px">'+
+        '<span data-testid="sender">Ada</span><span data-testid="subject">Deep '+n+'</span>'+
+        '<time datetime="'+new Date(Date.UTC(2026,10,1)+n*60000).toISOString()+'"></time></div>';
+      rows.firstElementChild.onclick=()=>{
+        document.querySelector('section').hidden=false;
+        document.querySelector('h2').textContent='Deep '+n;
+      };
+    }
+    scroll.onscroll=render; render();
+    document.querySelector('[aria-haspopup]').onclick=()=>document.querySelector('[role=menu]').hidden=false;
+    document.querySelector('[role=menuitem]').onclick=()=>{
+      const a=document.createElement('a'); a.download='deep.txt'; a.href=URL.createObjectURL(new Blob(['deep'])); a.click();
+      document.querySelector('[role=menu]').hidden=true;
+    };
+    </script>` }));
+  const outlook = new Outlook(async () => context);
+  const listed = await outlook.list("inbox", 1);
+  assert.equal(listed.messages[0].subject, "Deep 50", "the last of 50 scroll advances is selectable");
+  assert.equal(listed.scan_limit_reached, true);
+  const id = listed.messages[0].message_id;
+  const page = context.pages()[0];
+  const restarted = new Outlook(async () => context);
+  await page.goto("https://outlook.office.com/mail/archive/");
+  assert.equal((await restarted.read(id)).subject, "Deep 50");
+  await page.goto("https://outlook.office.com/mail/archive/");
+  assert.equal((await restarted.readMails([id])).results[0].data.body_markdown, "Deep body");
+  await page.goto("https://outlook.office.com/mail/archive/");
+  const attachment = await restarted.downloadAttachment(id, 0, 1024, async file => ({ text: await readFile(file.path, "utf8") }));
+  assert.equal(attachment.text, "deep");
+});

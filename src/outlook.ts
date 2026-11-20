@@ -86,6 +86,7 @@ function mailMetadata(root: Element, { s, row }: { s: typeof selectors; row: Row
 const temporaryIdMs = 30 * 60_000;
 /** Upper bound for `search_mail`'s limit. Higher values only help when Outlook will render more rows. */
 export const searchResultLimit = 40;
+const mailScrollLimit = 50;
 
 export async function waitForSurface(page: Page, surface: Locator, timeout: number, checkpoint = () => {}) {
   const deadline = Date.now() + timeout;
@@ -829,7 +830,7 @@ export class Outlook {
     add(await this.extractRows(this.resultList(page, folder)));
     let stuck = 0;
     let step = 0;
-    for (; step < 50 && this.hitsFrom(collected).length < limit; step++) {
+    for (; step < mailScrollLimit && this.hitsFrom(collected).length < limit; step++) {
       const moved = await this.scrollList(page, "next", folder);
       if (!moved) break;
       const before = collected.length;
@@ -838,7 +839,7 @@ export class Outlook {
         if (++stuck >= 3) break;
       } else stuck = 0;
     }
-    return { rows: collected, scan_limit_reached: step === 50 || stuck >= 3 };
+    return { rows: collected, scan_limit_reached: step === mailScrollLimit || stuck >= 3 };
   }
 
   list(folder: MailFolder = "inbox", limit = 10, unreadOnly = false, signal?: AbortSignal) {
@@ -1022,9 +1023,10 @@ export class Outlook {
     let matches = find(await this.extractRows(visibleRows()));
     if (matches.length) return matches;
     await this.scrollList(page, "top", folder);
-    for (let steps = 0; steps < 25; steps++) {
+    for (let steps = 0; steps <= mailScrollLimit; steps++) {
       matches = find(await this.extractRows(visibleRows()));
       if (matches.length) return matches;
+      if (steps === mailScrollLimit) break;
       const moved = await this.scrollList(page, "next", folder);
       if (!moved) break;
     }

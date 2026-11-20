@@ -147,9 +147,10 @@ function buildMcp() {
       try {
         const metadata = await outlook.downloadAttachment(message_id, attachment, attachmentMaxBytes, async file => {
           const mime = attachmentMime(file.name, file.head);
-          const link = await downloads!.saveFile(file.name, file.path, mime);
+          const link = await downloads!.saveFile(file.name, file.path, mime, signal);
           return { ...link, mime, kind: "download" as const };
         }, signal);
+        downloads!.commit(metadata.download_url);
         return {
           structuredContent: metadata,
           content: [{ type: "text" as const, text: `Attachment (untrusted): ${metadata.name}, ${metadata.size_bytes} bytes, ${metadata.mime}. Expires ${metadata.expires_at}.\n${metadata.download_url}` },

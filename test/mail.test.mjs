@@ -4,6 +4,7 @@ import { readFile, stat } from "node:fs/promises";
 import { launchChromium } from "./chromium.mjs";
 import { Outlook, waitForSurface } from "../dist/outlook.js";
 import { toolContracts } from "../dist/tool-contracts.js";
+import { startDownloads } from "../dist/downloads.js";
 
 const consume = async file => ({ data: await readFile(file.path) });
 
@@ -170,6 +171,20 @@ test("reads the real body, recipients and attachments from the modern layout", a
   toolContracts.read_mails.outputSchema.parse(batch);
   assert.throws(() => outlook.readMails([]), { code: "INVALID_RANGE" });
   assert.throws(() => outlook.readMails(Array(11).fill(id)), { code: "INVALID_RANGE" });
+  const downloads = await startDownloads({ host: "127.0.0.1", hostname: "127.0.0.1", port: 0,
+    maxRetainedBytes: 9, allowLoopbackForTest: true });
+  t.after(() => downloads.close());
+  const controller = new AbortController();
+  let cancelledLink;
+  await assert.rejects(outlook.downloadAttachment(id, 0, 4 * 1024 * 1024, async file => {
+    cancelledLink = await downloads.saveFile(file.name, file.path, "text/plain", controller.signal);
+    controller.abort();
+    return cancelledLink;
+  }, controller.signal), { code: "CANCELLED" });
+  await downloads.cleanup();
+  assert.equal((await fetch(cancelledLink.download_url)).status, 404);
+  const replacement = await downloads.save("replacement", Buffer.from("123456789"), "text/plain");
+  assert.equal(await (await fetch(replacement.download_url)).text(), "123456789", "cancelled unserved attachments must release the byte budget");
 });
 
 // Outlook paints only the rows near the viewport (here, 4 of 30). Search scrolls for more, and opening

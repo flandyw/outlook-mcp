@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readdir, mkdtemp, writeFile, stat, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { getEventListeners } from 'node:events';
 import { startDownloads } from '../dist/downloads.js';
 
 test('download links preserve bytes, reject other paths and methods, expire and clean up', async () => {
@@ -49,6 +50,16 @@ test('moves files without buffering, preserves bytes and makes the retained copy
   await assert.rejects(server.saveFile('missing.txt', source, 'text/plain'), { code: 'ENOENT' });
   const empty = await server.save('empty.txt', Buffer.alloc(0), 'text/plain');
   assert.equal(await (await fetch(empty.download_url)).text(), '');
+  const controller = new AbortController();
+  await writeFile(source, 'ok');
+  const retained = await server.saveFile('retained.txt', source, 'text/plain', controller.signal);
+  server.commit(retained.download_url);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  controller.abort();
+  assert.equal(await (await fetch(retained.download_url)).text(), 'ok', 'committed links survive normal request closure');
+  await writeFile(source, 'no');
+  await assert.rejects(server.saveFile('cancelled.txt', source, 'text/plain', controller.signal), { code: 'CANCELLED' });
+  assert.equal((await stat(source)).size, 2);
 });
 
 test('retained-byte quota rejects unserved files and evicts oldest served files under pressure', async t => {

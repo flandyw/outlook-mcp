@@ -18,7 +18,7 @@ export async function startDownloads({ host, port = 8766, hostname, ttlMs = 30 *
     throw new Error("Attachment server must bind to an IPv4 address on tailscale0.");
   }
   const dir = await mkdtemp(join(tmpdir(), "outlook-attachments-"));
-  const files = new Map<string, { path: string; name: string; mime: string; size: number; expires: number; served: boolean; readers: number }>();
+  const files = new Map<string, { path: string; name: string; mime: string; size: number; expires: number; served: boolean; readers: number; stopWatching: () => void }>();
   let retainedBytes = 0;
   let queue = Promise.resolve();
   function serialize<T>(work: () => Promise<T>) {
@@ -32,6 +32,7 @@ export async function startDownloads({ host, port = 8766, hostname, ttlMs = 30 *
         if (file.readers || (expiredOnly ? file.expires > Date.now() : !file.served || retainedBytes + needed <= maxRetainedBytes)) continue;
         files.delete(key);
         try { await rm(file.path, { force: true }); } catch (error) { files.set(key, file); throw error; }
+        file.stopWatching();
         retainedBytes -= file.size;
       }
     }
@@ -64,17 +65,28 @@ export async function startDownloads({ host, port = 8766, hostname, ttlMs = 30 *
   }
   const timer = setInterval(() => void cleanup().catch(error => console.error("Attachment cleanup failed", error)), 30_000);
   timer.unref();
-  function save(name: string, size: number, mime: string, write: (path: string) => Promise<void>) {
+  function save(name: string, size: number, mime: string, write: (path: string) => Promise<void>, signal?: AbortSignal) {
     return serialize(async () => {
+      if (signal?.aborted) throw new MailError("CANCELLED", "The request was cancelled.");
       if (size > maxRetainedBytes) throw new MailError("ATTACHMENT_TOO_LARGE", "Attachment exceeds the retained storage byte limit.");
       await evict(size);
       const token = randomBytes(32).toString("hex");
       const safeName = name.replace(/[\\/\x00-\x1f\x7f]/g, "_").slice(0, 200) || "attachment";
       const key = "/" + token + "/" + encodeURIComponent(safeName);
       const path = join(dir, token);
-      try { await write(path); } catch (error) { await rm(path, { force: true }); throw error; }
+      try {
+        await write(path);
+        if (signal?.aborted) throw new MailError("CANCELLED", "The request was cancelled.");
+      } catch (error) { await rm(path, { force: true }); throw error; }
       const expires = Date.now() + ttlMs;
-      files.set(key, { path, name: safeName, mime, size, expires, served: false, readers: 0 });
+      const file = { path, name: safeName, mime, size, expires, served: false, readers: 0, stopWatching: () => {} };
+      const cancelled = () => {
+        file.expires = 0;
+        void cleanup().catch(error => console.error("Attachment cancellation cleanup failed", error));
+      };
+      signal?.addEventListener("abort", cancelled, { once: true });
+      file.stopWatching = () => signal?.removeEventListener("abort", cancelled);
+      files.set(key, file);
       retainedBytes += size;
       const address = server.address();
       return { download_url: `http://${hostname}:${typeof address === "object" && address ? address.port : port}${key}`,
@@ -85,7 +97,7 @@ export async function startDownloads({ host, port = 8766, hostname, ttlMs = 30 *
     async save(name: string, data: Buffer, mime: string) {
       return save(name, data.length, mime, path => writeFile(path, data, { mode: 0o600, flag: "wx" }));
     },
-    async saveFile(name: string, source: string, mime: string) {
+    async saveFile(name: string, source: string, mime: string, signal?: AbortSignal) {
       const size = (await stat(source)).size;
       return save(name, size, mime, async path => {
         try { await rename(source, path); } catch (error) {
@@ -94,7 +106,10 @@ export async function startDownloads({ host, port = 8766, hostname, ttlMs = 30 *
           await rm(source);
         }
         await chmod(path, 0o600);
-      });
+      }, signal);
+    },
+    commit(downloadUrl: string) {
+      files.get(new URL(downloadUrl).pathname)?.stopWatching();
     },
     cleanup,
     directory: dir,
@@ -103,6 +118,7 @@ export async function startDownloads({ host, port = 8766, hostname, ttlMs = 30 *
       server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));
       await queue;
+      for (const file of files.values()) file.stopWatching();
       await rm(dir, { recursive: true, force: true });
     },
   };

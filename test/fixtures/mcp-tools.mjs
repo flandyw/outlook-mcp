@@ -2,10 +2,18 @@ import { EventEmitter } from "node:events";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { Outlook } from "../../dist/outlook.js";
+import { MailError, Outlook } from "../../dist/outlook.js";
 import { Calendar } from "../../dist/calendar.js";
 
 const id = "11111111-1111-4111-8111-111111111111";
+Outlook.prototype.createDraft = function (input, signal) {
+  return this.run(async () => {
+    this.preventRetry();
+    if (input.subject === "Fixture failure") throw new MailError("UI_CHANGED", "Fixture uncertain draft");
+    return { draft: true, subject: input.subject ?? "Re: Fixture", to: input.to, cc: input.cc ?? [],
+      reply_to_message_id: input.reply_to_message_id ?? null, saved_at: new Date().toISOString() };
+  }, signal);
+};
 const mail = { message_id: id, sender: "Ada", subject: "Fixture mail", received_at: null,
   to: null, cc: null, attachment_names: ["fixture.txt"],
   attachments: [{ index: 0, name: "fixture.txt", size_bytes: 7, type: "Text" }], body_markdown: "Fixture body", truncated: false };

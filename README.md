@@ -1,6 +1,6 @@
 # Outlook Web MCP
 
-A read-only TypeScript MCP server with six tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and message IDs. Read returns available message metadata, Markdown and attachment names. Attachments are returned as the original file for the model to read. Search scrolls the on-screen result list and returns only rows the adapter can identify. `mail_status` reports sign-in diagnostics and does not read mail. Calendar search reads events rendered in day view; read_event returns their details and notes.
+A read-only TypeScript MCP server with eight tools backed by a dedicated Playwright Chromium profile. Search returns message summaries and message IDs. Read returns available message metadata, Markdown and indexed attachment metadata. Attachments are returned as temporary download links to the original file. Search scrolls the on-screen result list and returns only rows the adapter can identify. `mail_status` reports last-observed sign-in diagnostics and does not read mail. Calendar search reads events rendered in day view; read_event returns their details and notes.
 
 This is an unofficial browser adapter, with no Microsoft Graph API registration
 required. It is not affiliated with Microsoft. Opening a message can mark it as
@@ -24,19 +24,27 @@ exposed tools: there is no send, reply, delete, move, or general flag action.
 | Tool | Input | Returns |
 | --- | --- | --- |
 | `search_mail` | `query` (Outlook search syntax, e.g. `from:alice`, `subject:invoice`, `hasattachments:yes`), `limit` 1–40 | `message_id`, sender, subject, `received_at`, `has_attachments`, snippet for each identifiable result |
-| `read_mail` | `message_id` from `search_mail` | sender, `to`, `cc`, `received_at`, `attachment_names`, `body_markdown`, `truncated` |
-| `read_attachment` | `message_id`, `attachment` (index into `attachment_names` or exact file name) | Text metadata: `name`, `size_bytes`, `mime`, `kind: download`, `download_url`, `expires_at` |
+| `read_mail` | `message_id` from `search_mail`; optional `max_body_chars` 1–12,000 (default 12,000) | sender, `to`, `cc`, `received_at`, `attachment_names`, `attachments` (`index`, `name`, visible `size_bytes`/`type` or null), `body_markdown`, `truncated` |
+| `read_mails` | `message_ids` (1–10 IDs); optional `max_body_chars` as above | `results` in input order, each with `message_id` and either `data` (read_mail result) or `error` |
+| `read_attachment` | `message_id`, `attachment` (zero-based attachment index or exact full filename, case-insensitive; duplicate names require an index) | `name`, `size_bytes`, `mime`, `kind: download`, `download_url`, `expires_at`, and a `resource_link` content item |
 | `mail_status` | none | `auth`, `browser`, `busy`, `last_success_at`, `last_error`, the automatic sign-in username and password source (`env`, `file` or `none`; never the password), and whether `OUTLOOK_PASSWORD_FILE` is configured and valid. `password_file_path` is included when configured. It does not read mail, sign in, or sign out. |
 | `search_events` | `start` and `end` (`YYYY-MM-DD`, end inclusive, at most 14 days), optional `query`, `limit` 1–25 | `event_id`, title, `start`, `end`, `all_day`, location and `date` for each rendered event |
 | `read_event` | `event_id` from `search_events` | times, location, attendees, recurrence, `body_markdown`, `truncated` |
+| `read_events` | `event_ids` (1–10 IDs) | `results` in input order, each with `event_id` and either `data` (read_event result) or `error` |
 
-Attachments are fetched with Outlook's own **Download** command, read into memory, deleted straight away and returned unchanged; the server does not convert or extract anything, so it is up to your MCP client and model to read PDFs or Office files. Files over 25 MB are refused (`OUTLOOK_ATTACHMENT_MAX_MB`); large files make large responses, so lower the limit if your client struggles. Set `OUTLOOK_ATTACHMENTS=0` to remove the tool. Cloud (OneDrive/SharePoint) links cannot be downloaded.
+Every tool declares an output schema and returns machine-readable `structuredContent` plus a human-readable text fallback (not a duplicate JSON dump). Errors retain `isError` and include `code`, `message`, and `retryable`. Batch item errors use the same fields. All tools are read-only and non-destructive; only local `mail_status` is advertised as idempotent. Mail reads can transiently mark mail as read; the existing best-effort unread restoration remains in place.
 
-`search_mail` scrolls Outlook’s result list until it has `limit` identifiable rows or the list stops rendering more. It still does not call a mail API, and it skips rows whose sender or subject it cannot see, so a broad query can return fewer hits than `limit`. Narrow queries stay faster and less ambiguous. When a conversation shows several expanded messages, `read_mail` returns each body separated by `---`. Images are blocked; their alt text appears as `(image: …)`. Bodies are capped at 12,000 characters.
+Attachments are fetched with Outlook's own **Download** command and moved into private temporary storage (disk-to-disk copy only if crossing filesystems), without buffering the whole file in Node. Only a small header is read to identify MIME type. The server does not convert, extract, open or run files. Files over 25 MiB are refused (`OUTLOOK_ATTACHMENT_MAX_MB`), using the visible size before download when available and checking the actual file size afterwards. Set `OUTLOOK_ATTACHMENTS=0` to remove the tool. Cloud (OneDrive/SharePoint) links cannot be downloaded.
+
+Mail and calendar share one serialized browser queue. Each request's three-minute deadline begins at enqueue time and includes queue wait and browser launch. Cancelled/disconnected requests are skipped before they start, or stop at checkpoints between active steps, retaining unread/editor cleanup. MCP cancellation notifications match unique active request IDs across stateless POSTs; clients should use globally unique request IDs when sharing this endpoint. Ambiguous cancellation IDs are ignored rather than cancelling another client's work. Batches occupy one queue job; calendar batch reads are grouped by day to reuse verified day views, but results remain in input order. An item failure does not discard other results; cancellation/deadline errors terminate the job.
+
+`search_mail` scrolls Outlook’s result list until it has `limit` identifiable rows or the list stops rendering more. It still does not call a mail API, and it skips rows whose sender or subject it cannot see, so a broad query can return fewer hits than `limit`. Narrow queries stay faster and less ambiguous. A row can represent a conversation, not an individual message. When a conversation shows several expanded messages, `read_mail` returns each visible body separated by `---`, not necessarily the entire thread. Images are blocked; their alt text appears as `(image: …)`. Bodies are capped at `max_body_chars` (default and maximum 12,000 characters); `truncated` reports omitted content.
 
 A result row with an Outlook item id (`data-item-id`) or conversation id (`data-convid`), including on a descendant of the row, gets a stable `ow1.` message ID. That ID embeds the search query plus the Outlook id, sender, subject, time and preview, so `read_mail` and `read_attachment` can run the search again and match the same row after a server restart or after the 30-minute in-memory cache expires. Treat the token as opaque mailbox metadata. Rows without either attribute still get a random UUID. Those temporary IDs, including ones already issued, keep working until they expire or the process restarts. A stable ID that no longer matches a single row returns `MESSAGE_CHANGED`.
 
-`search_events` reads Outlook's day view from `start` through `end`. If you omit the dates, it uses the day the calendar opens. `query` filters the rendered title and location; it is not Outlook search syntax and does not look outside that range. `event_id` expires after 30 minutes, as temporary mail IDs do. `read_event` opens that event's details peek. Notes use the same Markdown rules as mail: images become alt text, links are not followed, and the body is capped at 12,000 characters.
+`search_events` reads Outlook's day view from `start` through `end`, end-inclusive, at most 14 days. If you omit the dates, it uses the day the calendar opens. `query` filters the rendered title and location; it is not Outlook search syntax and does not look outside that range. Scanning stops after a day provides enough matches for `limit`; `scanned_start`, `scanned_end`, and `stopped_early` identify the actual scanned range, and `truncated` also covers omitted matches on the last scanned day. Results remain date-first. `event_id` expires after 30 minutes, as temporary mail IDs do. `read_event` opens that event's details peek. Notes use the same Markdown rules as mail: images become alt text, links are not followed, and the body is capped at 12,000 characters.
+
+`mail_status` reports **last observed** state, not a live authentication check. It does not start a browser, sign in, or query Outlook. Use the local control command `npm run status -- --check` for a live mailbox check.
 
 A calendar request confirms the signed-in mailbox, then uses a separate tab so the mail list stays put. The tools never create, edit, delete or respond to events. A single click opens the peek. Accept, Tentative, Decline, Edit, Delete and Save are not clicked. If Outlook opens the editor instead of the peek, the adapter closes it and discards unsaved changes. Only calendars already selected in Outlook are visible, and only the events drawn for each requested day. The date is read from a machine-readable attribute when Outlook provides one, otherwise from an English heading such as "12 November 2026". Times are returned as Outlook renders them, including a datetime attribute when one is present. An aria-label without structured fields is parsed on commas, so a title that itself contains a comma can be cut short.
 
@@ -141,7 +149,10 @@ Temporary search result IDs expire after 30 minutes or on server restart. Stable
 - `INVALID_RANGE`: the dates, query or limit cannot be used. Ranges are real `YYYY-MM-DD` dates of at most 14 days.
 - `SIGNED_OUT`: `npm run logout` is running.
 - `NETWORK_ERROR`: Outlook could not be reached.
-- `TIMEOUT`: Outlook was slow. If one request runs longer than 3 minutes, the browser is reset. Retry.
+- `TIMEOUT`: the three-minute enqueue deadline elapsed. Queued work is skipped; a timed-out active browser operation resets the browser. Retry.
+- `CANCELLED`: the MCP request was cancelled or disconnected. Queued work is skipped; active work stops at checkpoints.
+- `STORAGE_FULL`: retained attachment storage is full of unexpired, unserved files. Retry after links expire.
+- `ATTACHMENT_TOO_LARGE`: the visible/actual file size or retained-byte budget is exceeded.
 - `BROWSER_RESTARTED`: the browser crashed or its window closed. The next request starts a new one.
 - `PROFILE_LOCKED`: another browser (an old `npm start`, or a direct `npm run login`) is using the profile.
 - `UI_CHANGED`: the adapter could not identify a search region, row or reading pane. Outlook error pages get one automatic reload first.
@@ -172,7 +183,11 @@ the default is the machine hostname plus `.tail4832d.ts.net`.
 
 Each download has a fresh 256-bit random token. Anyone on the tailnet with the link can
 download it until its 30-minute expiry; treat links as secrets. Expired links immediately
-return 404. A cleanup pass deletes expired copies every 30 seconds. Files have mode 0600
+return 404. A cleanup pass deletes expired copies every 30 seconds. Retained files total at most
+100 MiB (`OUTLOOK_ATTACHMENT_RETAINED_MB` overrides this). When space is needed, expired files
+and then the oldest already-served files are evicted; served links may therefore disappear before
+their advertised expiry. Unserved, unexpired files are not evicted: new downloads get `STORAGE_FULL`
+if no room remains. In-progress GETs are protected from eviction. Files have mode 0600
 inside a private temporary directory. Request paths are matched against an in-memory map,
 never resolved as filesystem paths; there is no directory listing. All attachment types
 return text metadata, so MCP hosts need not handle embedded binary resources.

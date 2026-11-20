@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { launchChromium } from "./chromium.mjs";
 import { Calendar, parseCalendarDate } from "../dist/calendar.js";
 import { Outlook } from "../dist/outlook.js";
+import { toolContracts } from "../dist/tool-contracts.js";
 
 const fixture = name => readFileSync(new URL("./fixtures/calendar/" + name, import.meta.url), "utf8");
 const mailShell = fixture("mail-shell.html");
@@ -18,6 +19,27 @@ test("parses English calendar headings and rejects impossible dates", () => {
   assert.equal(parseCalendarDate("Wednesday, November 12, 2026"), "2026-11-12");
   assert.equal(parseCalendarDate("31 November 2026"), null);
   assert.equal(parseCalendarDate("no date here"), null);
+});
+
+test("batch reads group events by day in one queue job and preserve input/error order", async t => {
+  const loaded = [];
+  const { calendar, outlook } = await start(t, serve(url => { loaded.push(url.pathname); return calendarHtml(); }));
+  const found = await calendar.search({ start: "2026-11-12", end: "2026-11-13" });
+  const ids = found.events.map(e => e.event_id);
+  loaded.length = 0;
+  let jobs = 0;
+  const useBrowser = outlook.useBrowser.bind(outlook);
+  outlook.useBrowser = (...args) => { jobs++; return useBrowser(...args); };
+  const input = [ids[2], ids[0], "missing", ids[1]];
+  const batch = await calendar.readEvents(input);
+  assert.equal(jobs, 1);
+  assert.deepEqual(batch.results.map(item => item.event_id), input);
+  assert.deepEqual(batch.results.map(item => item.data?.title ?? item.error.code), ["Assembly", "Specialist Maths", "UNKNOWN_EVENT", "Chemistry prac"]);
+  assert.equal(batch.results[2].error.retryable, false);
+  assert.equal(loaded.length, 2, "one load per requested day, not per event");
+  toolContracts.read_events.outputSchema.parse(batch);
+  assert.throws(() => calendar.readEvents([]), { code: "INVALID_RANGE" });
+  assert.throws(() => calendar.readEvents(Array(11).fill(ids[0])), { code: "INVALID_RANGE" });
 });
 
 test("rejects a bad range or unknown event without launching a browser", async () => {
@@ -80,6 +102,7 @@ test("lists and reads day-view events without touching mail or event actions", a
   const messageId = mail.messages[0].message_id;
 
   const today = await calendar.search({ limit: 10 });
+  toolContracts.search_events.outputSchema.parse(today);
   assert.equal(today.scope, "rendered_day_view");
   assert.deepEqual([today.start, today.end, today.query], ["2026-11-12", "2026-11-12", null]);
   assert.deepEqual(today.events.map(event => event.title), ["Specialist Maths", "Chemistry prac"]);
@@ -114,6 +137,7 @@ test("lists and reads day-view events without touching mail or event actions", a
 
   const mathsId = today.events[0].event_id;
   const maths = await calendar.read(mathsId);
+  toolContracts.read_event.outputSchema.parse(maths);
   assert.equal(maths.title, "Specialist Maths");
   assert.equal(maths.location, "Room 4");
   assert.equal(maths.when, "Thursday, 12 November 2026 9:00 AM – 10:15 AM");

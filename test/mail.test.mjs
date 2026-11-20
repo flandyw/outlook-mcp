@@ -1,7 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFile, stat } from "node:fs/promises";
 import { launchChromium } from "./chromium.mjs";
 import { Outlook, waitForSurface } from "../dist/outlook.js";
+import { toolContracts } from "../dist/tool-contracts.js";
+
+const consume = async file => ({ data: await readFile(file.path) });
 
 test("searches and reads a message using the browser", async t => {
   const browser = await launchChromium();
@@ -43,6 +47,9 @@ test("searches and reads a message using the browser", async t => {
   assert.equal(message.subject, "Delivery window");
   assert.equal(message.received_at, "2026-11-11T10:42:00+11:00");
   assert.deepEqual(message.attachment_names, ["delivery.pdf"]);
+  assert.deepEqual(message.attachments, [{ index: 0, name: "delivery.pdf", size_bytes: null, type: null }]);
+  toolContracts.search_mail.outputSchema.parse(hits);
+  toolContracts.read_mail.outputSchema.parse(message);
   assert.equal(message.body_markdown, "The courier confirmed Friday.\n\n- Clear the loading bay\n\nDelivery details");
   await assert.rejects(outlook.read("unknown"), { code: "UNKNOWN_MESSAGE" });
 });
@@ -76,7 +83,7 @@ test("reads the real body, recipients and attachments from the modern layout", a
           </div>
         </div>
         <div role="listbox" aria-label="file attachments">
-          <div role="option" aria-label="plan.pdf Open 3 MB"><div title="plan.pdf">plan.pdf</div><div>3 MB</div>
+          <div role="option" aria-label="plan.pdf Open 3 MB"><div title="plan.pdf">plan.pdf</div><div>3 MB</div><span data-testid="attachment-type">PDF document</span>
             <button aria-label="More actions" aria-haspopup="true" data-file="plan.pdf" data-body="Plan body">⋯</button></div>
           <div role="option" aria-label="notes.txt Open 1 KB"><div title="notes.txt">notes.txt</div><div>1 KB</div>
             <button aria-label="More actions" aria-haspopup="true" data-file="notes.txt" data-body="Remember the milk">⋯</button></div>
@@ -131,19 +138,38 @@ test("reads the real body, recipients and attachments from the modern layout", a
   assert.equal(message.cc, null);
   assert.deepEqual(message.attachment_names, ["plan.pdf", "notes.txt", "Shared link", "photo.jpg"]);
   const id = hits.messages[0].message_id;
-  const byIndex = await outlook.downloadAttachment(id, 1, 1024);
+  assert.deepEqual(message.attachments.map(a => [a.index, a.name, a.size_bytes, a.type]), [
+    [0, "plan.pdf", 3 * 1024 * 1024, "PDF document"], [1, "notes.txt", 1024, null], [2, "Shared link", null, null], [3, "photo.jpg", 2 * 1024 * 1024, null],
+  ]);
+  const byIndex = await outlook.downloadAttachment(id, 1, 4 * 1024 * 1024, consume);
   assert.deepEqual([byIndex.name, byIndex.size_bytes, byIndex.data.toString()], ["notes.txt", 17, "Remember the milk"]);
-  const byName = await outlook.downloadAttachment(id, "PLAN.PDF", 1024);
+  let downloadPath;
+  const byName = await outlook.downloadAttachment(id, "PLAN.PDF", 4 * 1024 * 1024, async file => {
+    downloadPath = file.path;
+    assert.equal(file.head.toString(), "Plan body");
+    return consume(file);
+  });
   assert.equal(byName.data.toString(), "Plan body");
+  await assert.rejects(stat(downloadPath), { code: "ENOENT" });
   await assert.rejects(outlook.downloadAttachment(id, "missing.doc", 1024), { code: "UNKNOWN_ATTACHMENT", message: /notes\.txt/ });
   await assert.rejects(outlook.downloadAttachment(id, 7, 1024), { code: "UNKNOWN_ATTACHMENT" });
   await assert.rejects(outlook.downloadAttachment(id, 2, 1024), { code: "ATTACHMENT_UNAVAILABLE" });
-  const photo = await outlook.downloadAttachment(id, 3, 1024);
+  const photo = await outlook.downloadAttachment(id, 3, 4 * 1024 * 1024, consume);
   assert.deepEqual([photo.name, photo.data.toString()], ["photo.jpg", "JPEG bytes"]);
   await assert.rejects(outlook.downloadAttachment(id, 0, 4), { code: "ATTACHMENT_TOO_LARGE" });
+  assert.equal(await context.pages()[0].locator('[role="menu"]').isHidden(), true, "visible oversized files are rejected before opening a menu");
   // The second message shares the conversation key, sender and subject. After previews change it must still resolve.
   const second = await outlook.read(hits.messages[1].message_id);
   assert.equal(second.received_at, "Tue 2026-11-10 08:00");
+  const batch = await outlook.readMails([id, "missing", hits.messages[1].message_id], 5);
+  assert.deepEqual(batch.results.map(r => r.message_id), [id, "missing", hits.messages[1].message_id]);
+  assert.equal(batch.results[0].data.body_markdown, "Hi Sa");
+  assert.equal(batch.results[0].data.truncated, true);
+  assert.equal(batch.results[1].error.code, "UNKNOWN_MESSAGE");
+  assert.equal(batch.results[2].data.received_at, second.received_at);
+  toolContracts.read_mails.outputSchema.parse(batch);
+  assert.throws(() => outlook.readMails([]), { code: "INVALID_RANGE" });
+  assert.throws(() => outlook.readMails(Array(11).fill(id)), { code: "INVALID_RANGE" });
 });
 
 // Outlook paints only the rows near the viewport (here, 4 of 30). Search scrolls for more, and opening
@@ -272,6 +298,7 @@ test("reads empty and image-only bodies without polling for visible body dimensi
   assert.equal(empty.to, null);
   assert.equal(empty.cc, null);
   assert.deepEqual(empty.attachment_names, []);
+  assert.deepEqual(empty.attachments, []);
   await page.locator('#UniqueMessageBody_1').evaluate(node => { node.innerHTML = '<img alt="diagram">'; });
   assert.equal((await outlook.read(id)).body_markdown, "(image: diagram)");
   assert.ok(!waits.includes(150), "present zero-sized bodies must not enter the readiness poll");
@@ -281,6 +308,10 @@ test("reads empty and image-only bodies without polling for visible body dimensi
   const large = await outlook.read(id);
   assert.equal(large.body_markdown, '😀'.repeat(12000));
   assert.equal(large.truncated, true);
+  const short = await outlook.read(id, 5);
+  assert.equal(short.body_markdown, '😀'.repeat(5));
+  assert.equal(short.truncated, true);
+  for (const limit of [0, 12001, 1.5]) await assert.rejects(outlook.read(id, limit), { code: "INVALID_RANGE" });
   assert.equal(await page.evaluate(() => window.tailVisits), 0);
   await page.locator('#UniqueMessageBody_1').evaluate(node => {
     node.remove();

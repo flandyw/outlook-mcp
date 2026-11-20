@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { BrowserContext, Page } from "playwright";
 import { mailbox, outlookOrigins, safeOrigin } from "./browser.js";
 import { formatBody, type BodyPart } from "./format.js";
-import { MailError, SessionLostError, waitForSurface, type Outlook } from "./outlook.js";
+import { MailError, SessionLostError, errorInfo, waitForSurface, type Outlook } from "./outlook.js";
 import { isMicrosoftLogin } from "./reauth.js";
 
 const signInHelp = "Run npm run login on the server host to sign in again.";
@@ -266,7 +266,7 @@ export class Calendar {
 
   private async waitForCalendar(page: Page) {
     const surface = this.surface(page);
-    const winner = await waitForSurface(page, surface, 20000);
+    const winner = await waitForSurface(page, surface, 20000, () => this.outlook.checkpoint());
     if (winner === "login" || isMicrosoftLogin(page)) this.authRequired();
     if (winner !== "ready") {
       if (page.url().startsWith("chrome-error:")) {
@@ -331,6 +331,7 @@ export class Calendar {
   }
 
   private async openDay(page: Page, date?: string) {
+    this.outlook.checkpoint();
     if (this.verifiedDay?.page === page && this.verifiedDay.url === page.url()
         && outlookOrigins.has(safeOrigin(page.url())) && await this.surface(page).isVisible().catch(() => false)) {
       const shown = await this.readShownDate(page).catch(() => null);
@@ -468,7 +469,7 @@ export class Calendar {
     return ref;
   }
 
-  async search(input: CalendarSearch = {}) {
+  async search(input: CalendarSearch = {}, signal?: AbortSignal) {
     const limit = input.limit ?? 10;
     if (!Number.isInteger(limit) || limit < 1 || limit > 25) {
       throw new MailError("INVALID_RANGE", "limit must be an integer from 1 to 25.");
@@ -507,16 +508,40 @@ export class Calendar {
       return { events, scope: "rendered_day_view" as const, start, end, query: query ?? null,
         scanned_start: start, scanned_end: scannedEnd, stopped_early: scannedEnd < end,
         truncated: scannedEnd < end || collected.length > limit };
-    });
+    }, signal);
   }
 
   /**
    * Opens the event peek. Single click only. If Outlook shows the editor (a title
    * box plus Save), Escape and Discard run and the read fails closed — Save is not clicked.
    */
-  async read(id: string): Promise<EventDetails> {
+  async read(id: string, signal?: AbortSignal): Promise<EventDetails> {
     const ref = this.reference(id);
+    return this.outlook.useBrowser(context => this.readInContext(context, ref, id), signal);
+  }
+
+  readEvents(ids: string[], signal?: AbortSignal) {
+    if (!ids.length || ids.length > 10) throw new MailError("INVALID_RANGE", "Pass 1 to 10 event IDs.");
     return this.outlook.useBrowser(async context => {
+      const pending = ids.map((event_id, index) => ({ event_id, index, date: this.refs.get(event_id)?.date ?? "" }));
+      pending.sort((a, b) => a.date.localeCompare(b.date));
+      const results: { event_id: string; data?: EventDetails; error?: ReturnType<typeof errorInfo> }[] = new Array(ids.length);
+      for (const item of pending) {
+        this.outlook.checkpoint();
+        try {
+          results[item.index] = { event_id: item.event_id, data: await this.readInContext(context, this.reference(item.event_id), item.event_id) };
+        } catch (error) {
+          this.outlook.checkpoint();
+          if (error instanceof SessionLostError) throw error;
+          results[item.index] = { event_id: item.event_id, error: errorInfo(error) };
+        }
+      }
+      return { results };
+    }, signal);
+  }
+
+  private async readInContext(context: BrowserContext, ref: EventRef, id: string): Promise<EventDetails> {
+      this.outlook.checkpoint();
       const page = await this.pageFor(context);
       await this.openDay(page, ref.date);
       const events = await this.collect(page, ref.date);
@@ -525,6 +550,7 @@ export class Calendar {
       const card = this.surface(page).locator(selectors.event).nth(match.index);
       const titleNode = card.locator(selectors.title).first();
       const target = await titleNode.count() ? titleNode : card;
+      this.outlook.checkpoint();
       let editor = false;
       try {
         await target.click({ clickCount: 1 });
@@ -538,11 +564,11 @@ export class Calendar {
           editor = true;
           await this.abandonEditor(page);
         }
+        this.outlook.checkpoint();
         return await this.extractDetails(dialog, ref, id);
       } finally {
         if (!editor) await page.keyboard.press("Escape").catch(() => {});
       }
-    });
   }
 
   private async isEditor(dialog: ReturnType<Page["locator"]>) {

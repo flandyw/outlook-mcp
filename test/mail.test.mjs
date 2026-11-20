@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { launchChromium } from "./chromium.mjs";
-import { Outlook } from "../dist/outlook.js";
+import { Outlook, waitForSurface } from "../dist/outlook.js";
 
 test("searches and reads a message using the browser", async t => {
   const browser = await launchChromium();
@@ -174,7 +174,7 @@ test("honors limit past the first painted page and can reopen a virtualized row"
           scroller.scrollTop = 1000; // Outlook moves the list after opening a message.
         });
       };
-      scroller.addEventListener('scroll', render);
+      scroller.addEventListener('scroll', () => setTimeout(render, 30));
       document.querySelector('input').addEventListener('keydown', event => {
         if (event.key !== 'Enter') return;
         fetch('/searchservice/api/v2/query', { method: 'POST' }).then(() => {
@@ -186,6 +186,12 @@ test("honors limit past the first painted page and can reopen a virtualized row"
   }));
   const outlook = new Outlook(async () => context);
   const first = await outlook.search("subject", 1);
+  const page = context.pages()[0];
+  const originalWait = page.waitForTimeout.bind(page);
+  page.waitForTimeout = ms => {
+    assert.notEqual(ms, 250, "scrolling must wait for changed rows rather than sleep");
+    return originalWait(ms);
+  };
   assert.deepEqual(first.messages.map(message => message.subject), ["Subject 0"]);
   const hits = await outlook.search("subject", 25);
   assert.deepEqual(hits.messages.map(message => message.subject),
@@ -204,6 +210,101 @@ test("rejects malformed message ids before opening the browser", async () => {
   await assert.rejects(outlook.read("ow1.bm90LWpzb24"), { code: "UNKNOWN_MESSAGE" });
   await assert.rejects(outlook.read(incomplete), { code: "UNKNOWN_MESSAGE" });
   await assert.rejects(outlook.downloadAttachment(incomplete, 0, 100), { code: "UNKNOWN_MESSAGE" });
+});
+
+test("fills search immediately, verifies the value and falls back only when rejected", async t => {
+  const browser = await launchChromium();
+  t.after(() => browser.close());
+  for (const rejectFill of [false, true]) {
+    const context = await browser.newContext();
+    await context.route("https://outlook.office.com/**", route => route.fulfill({ contentType: "text/html", body: `
+      <input id="topSearchInput"><div id="MailList" hidden>No results</div><script>
+      window.keys = 0; window.inputs = 0; window.requests = 0;
+      const input = document.querySelector('input');
+      input.addEventListener('input', event => {
+        window.inputs++;
+        if (${rejectFill} && event.inputType === 'insertText' && event.data?.length > 1) input.value = '';
+      });
+      input.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') { window.keys++; return; }
+        window.submitted = input.value;
+        fetch('/searchservice/api/v2/query', {method:'POST'}).then(() => {
+          window.requests++; document.querySelector('#MailList').hidden = false;
+        });
+      });</script>` }));
+    const outlook = new Outlook(async () => context);
+    const query = "subject:mail latency";
+    assert.deepEqual((await outlook.search(query, 10)).messages, []);
+    const state = await context.pages()[0].evaluate(() => ({ keys: window.keys, submitted: window.submitted, requests: window.requests, inputs: window.inputs }));
+    assert.equal(state.submitted, query);
+    assert.equal(state.requests, 1);
+    assert.ok(state.inputs >= 1);
+    assert.equal(state.keys > 0, rejectFill);
+    await outlook.close();
+  }
+});
+
+test("reads empty and image-only bodies without polling for visible body dimensions and bounds large bodies", async t => {
+  const browser = await launchChromium();
+  t.after(() => browser.close());
+  const context = await browser.newContext();
+  await context.route("https://outlook.office.com/**", route => route.fulfill({ contentType: "text/html", body: `
+    <input type="search" aria-label="Search"><section aria-label="Search results" hidden>
+    <div role="listbox"><div role="option" data-item-id="body-test"><span data-testid="sender">Ada</span>
+    <span data-testid="subject">Body test</span></div></div></section>
+    <section aria-label="Reading Pane" hidden><h2>Body test</h2><div id="UniqueMessageBody_1"></div></section>
+    <script>
+    document.querySelector('input').onkeydown = e => { if(e.key==='Enter') document.querySelector('section').hidden=false; };
+    document.querySelector('[role=option]').onclick = () => {document.querySelector('[aria-label="Reading Pane"]').hidden=false;};
+    window.tailVisits=0; const original = window.getComputedStyle;
+    window.getComputedStyle = function(node, ...args) { if(node.id==='tail') window.tailVisits++; return original.call(this,node,...args); };
+    </script>` }));
+  const outlook = new Outlook(async () => context);
+  const hits = await outlook.search("body", 1);
+  const page = context.pages()[0];
+  const waits = [];
+  const originalWait = page.waitForTimeout.bind(page);
+  page.waitForTimeout = ms => { waits.push(ms); return originalWait(ms); };
+  const id = hits.messages[0].message_id;
+  const empty = await outlook.read(id);
+  assert.equal(empty.body_markdown, "");
+  assert.equal(empty.truncated, false);
+  assert.equal(empty.to, null);
+  assert.equal(empty.cc, null);
+  assert.deepEqual(empty.attachment_names, []);
+  await page.locator('#UniqueMessageBody_1').evaluate(node => { node.innerHTML = '<img alt="diagram">'; });
+  assert.equal((await outlook.read(id)).body_markdown, "(image: diagram)");
+  assert.ok(!waits.includes(150), "present zero-sized bodies must not enter the readiness poll");
+  await page.locator('#UniqueMessageBody_1').evaluate(node => {
+    node.innerHTML = '<p>' + '😀'.repeat(50000) + '</p><p id="tail">must not walk</p>';
+  });
+  const large = await outlook.read(id);
+  assert.equal(large.body_markdown, '😀'.repeat(12000));
+  assert.equal(large.truncated, true);
+  assert.equal(await page.evaluate(() => window.tailVisits), 0);
+  await page.locator('#UniqueMessageBody_1').evaluate(node => {
+    node.remove();
+    setTimeout(() => { document.querySelector('[aria-label="Reading Pane"]').insertAdjacentHTML('beforeend',
+      '<div id="UniqueMessageBody_1"><p>Delayed body</p><div hidden>Hidden body</div></div>'); }, 30);
+  });
+  assert.equal((await outlook.read(id)).body_markdown, "Delayed body");
+  await page.locator('#UniqueMessageBody_1').evaluate(node => node.remove());
+  await assert.rejects(outlook.read(id), { code: "UI_CHANGED" });
+  await outlook.close();
+});
+
+test("readiness polling settles all work on ready, login, timeout and closed pages", async () => {
+  for (const scenario of ["ready", "login", "timeout", "closed"]) {
+    let checks = 0;
+    const page = { url: () => scenario === "login" ? "https://login.microsoftonline.com/" : "https://outlook.office.com/mail/",
+      isClosed: () => scenario === "closed", waitForURL: () => { throw Error("must not leave a navigation waiter"); } };
+    const surface = { isVisible: async () => { checks++; return scenario === "ready"; } };
+    const outcome = await waitForSurface(page, surface, 5);
+    assert.equal(outcome, scenario === "closed" ? "timeout" : scenario);
+    const settledChecks = checks;
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(checks, settledChecks);
+  }
 });
 
 test("keeps stable ids usable after expiry and restart, and temporary ids until they expire", async t => {

@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { BrowserContext, Page } from "playwright";
-import { mailbox, outlookOrigins, safeOrigin, signInOrigins } from "./browser.js";
+import { mailbox, outlookOrigins, safeOrigin } from "./browser.js";
 import { formatBody, type BodyPart } from "./format.js";
-import { MailError, SessionLostError, type Outlook } from "./outlook.js";
+import { MailError, SessionLostError, waitForSurface, type Outlook } from "./outlook.js";
 import { isMicrosoftLogin } from "./reauth.js";
 
 const signInHelp = "Run npm run login on the server host to sign in again.";
@@ -266,17 +266,9 @@ export class Calendar {
 
   private async waitForCalendar(page: Page) {
     const surface = this.surface(page);
-    const surfaceWait = surface.waitFor({ state: "visible", timeout: 20000 }).then(() => true, () => false);
-    const loginWait = page.waitForURL(url => {
-      const value = typeof url === "string" ? url : url.toString();
-      return signInOrigins.has(safeOrigin(value));
-    }, { timeout: 20000 }).then(() => true, () => false);
-    const winner = await Promise.race([
-      loginWait.then(seen => seen ? "login" as const : "later" as const),
-      surfaceWait.then(seen => seen ? "surface" as const : "later" as const),
-    ]);
+    const winner = await waitForSurface(page, surface, 20000);
     if (winner === "login" || isMicrosoftLogin(page)) this.authRequired();
-    if (winner !== "surface" && !await surfaceWait) {
+    if (winner !== "ready") {
       if (page.url().startsWith("chrome-error:")) {
         throw new MailError("NETWORK_ERROR", "Could not reach Outlook. Check the network connection and try again.");
       }

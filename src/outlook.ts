@@ -47,6 +47,19 @@ const temporaryIdMs = 30 * 60_000;
 /** Upper bound for `search_mail`'s limit. Higher values only help when Outlook will render more rows. */
 export const searchResultLimit = 40;
 
+export async function waitForSurface(page: Page, surface: Locator, timeout: number) {
+  const deadline = Date.now() + timeout;
+  do {
+    if (isMicrosoftLogin(page)) return "login" as const;
+    if (await surface.isVisible().catch(() => false)) return "ready" as const;
+    if (page.isClosed()) break;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)));
+  } while (Date.now() < deadline);
+  return "timeout" as const;
+}
+
 const hasKey = (row: Row) => Boolean(JSON.parse(row.fingerprint)[0]);
 
 function rowKey(row: Row) {
@@ -519,11 +532,7 @@ export class Outlook {
           await this.recoverSession(page);
           if (!outlookOrigins.has(safeOrigin(page.url()))) await load("goto");
         }
-        const outcome = await Promise.race([
-          search.waitFor({ timeout: readyMs }).then(() => "ready" as const, () => "timeout" as const),
-          page.waitForURL(url => signInOrigins.has(safeOrigin(String(url))), { timeout: readyMs, waitUntil: "commit" })
-            .then(() => "login" as const, () => new Promise<never>(() => {})),
-        ]);
+        const outcome = await waitForSurface(page, search, readyMs);
         if (outcome === "ready" && !isMicrosoftLogin(page)) break;
         if (outcome === "login" || isMicrosoftLogin(page)) continue;
         if (page.url().startsWith("chrome-error:") && !blockedNavigation) {
@@ -565,9 +574,13 @@ export class Outlook {
     const { search, modernSearch } = await this.ensureMailbox(page);
     const modern = await modernSearch.isVisible();
     if (modern) {
-      await modernSearch.click();
-      await modernSearch.press("Control+a");
-      await modernSearch.pressSequentially(query, { delay: 20 });
+      await modernSearch.fill(query);
+      if (await modernSearch.inputValue() !== query) {
+        await modernSearch.click();
+        await modernSearch.press("Control+a");
+        await modernSearch.pressSequentially(query, { delay: 20 });
+      }
+      if (await modernSearch.inputValue() !== query) throw new MailError("UI_CHANGED", "Outlook did not accept the search query.");
     } else {
       await search.fill(query);
     }
@@ -663,13 +676,12 @@ export class Outlook {
       collected.push(...fresh);
       for (const row of list) seen.add(row.fingerprint);
     };
-    if (await this.scrollList(page, "top")) await page.waitForTimeout(250);
+    await this.scrollList(page, "top");
     add(await this.extractRows(this.resultList(page)));
     let stuck = 0;
     for (let step = 0; step < 50 && this.hitsFrom(collected).length < limit; step++) {
       const moved = await this.scrollList(page, "next");
       if (!moved) break;
-      await page.waitForTimeout(250);
       const before = collected.length;
       add(await this.extractRows(this.resultList(page)));
       if (collected.length === before) {
@@ -758,20 +770,63 @@ export class Outlook {
       throw new MailError("MESSAGE_CHANGED", "Search results changed before opening the message.");
     }
     const wasUnread = await this.rowWasUnread(candidate);
-    await candidate.locator(selectors.subject).first().click();
+    const clicked = await candidate.evaluate(async (node, { s, fingerprint }) => {
+      const text = (selector: string) => node.querySelector(selector)?.textContent?.trim() ?? "";
+      const timeNode = node.querySelector("time");
+      const time = timeNode?.getAttribute("datetime") ?? timeNode?.textContent?.trim()
+        ?? node.querySelector(".qq2gS[title]")?.getAttribute("title") ?? "";
+      let key: string | null = null;
+      for (const name of s.keyAttributes) {
+        const value = node.getAttribute(name) || node.querySelector("[" + name + "]")?.getAttribute(name);
+        if (value) { key = value; break; }
+      }
+      if (JSON.stringify([key, text(s.sender), text(s.subject), time, text(s.preview)]) !== fingerprint) return false;
+      const subject = node.querySelector<HTMLElement>(s.subject);
+      if (!subject || !node.isConnected) return false;
+      let scrollable = node.parentElement;
+      while (scrollable && !(scrollable.scrollHeight > scrollable.clientHeight + 4
+          && /auto|scroll/.test(getComputedStyle(scrollable).overflowY))) scrollable = scrollable.parentElement;
+      const identity = () => scrollable ? JSON.stringify(Array.from(scrollable.querySelectorAll(s.results), row =>
+        [row.getAttribute("data-item-id"), row.getAttribute("data-convid"), row.querySelector(s.subject)?.textContent])) : "";
+      const before = scrollable?.scrollTop;
+      const windowBefore = identity();
+      subject.click();
+      if (scrollable && scrollable.scrollTop !== before && identity() === windowBefore) {
+        await new Promise<void>(resolve => {
+          let frame = 0;
+          const finish = () => { clearTimeout(timer); cancelAnimationFrame(frame); resolve(); };
+          const check = () => { if (identity() !== windowBefore) finish(); else frame = requestAnimationFrame(check); };
+          const timer = setTimeout(finish, 250);
+          check();
+        });
+      }
+      return true;
+    }, { s: selectors, fingerprint: row.fingerprint });
+    if (!clicked) throw new MailError("MESSAGE_CHANGED", "Search results changed before opening the message.");
     return { row, wasUnread };
   }
 
   // Moves the list's scroll container: "top" resets it, "next" advances most of a screen. Returns false at the end.
   private scrollList(page: Page, step: "top" | "next") {
-    return searchRegion(page).evaluate((root, step) => {
+    return searchRegion(page).evaluate(async (root, { step, results }) => {
       const scrollable = [root, ...root.querySelectorAll("*")].find(element =>
         element.scrollHeight > element.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(element).overflowY));
       if (!scrollable) return false;
+      const identity = () => JSON.stringify(Array.from(root.querySelectorAll(results)).map(node =>
+        [node.getAttribute("data-item-id"), node.getAttribute("data-convid"), node.id, node.textContent]));
+      const windowBefore = identity();
       const before = scrollable.scrollTop;
       scrollable.scrollTop = step === "top" ? 0 : before + scrollable.clientHeight * 0.8;
-      return step === "top" ? before !== 0 : scrollable.scrollTop !== before;
-    }, step).catch(() => false);
+      if (scrollable.scrollTop === before) return false;
+      await new Promise<void>(resolve => {
+        let frame = 0;
+        const finish = () => { clearTimeout(timer); cancelAnimationFrame(frame); resolve(); };
+        const check = () => { if (identity() !== windowBefore) finish(); else frame = requestAnimationFrame(check); };
+        const timer = setTimeout(finish, 250);
+        check();
+      });
+      return true;
+    }, { step, results: selectors.results }).catch(() => false);
   }
 
   /**
@@ -782,12 +837,11 @@ export class Outlook {
     const visibleRows = () => this.resultList(page);
     let matches = find(await this.extractRows(visibleRows()));
     if (matches.length) return matches;
-    let moved = await this.scrollList(page, "top");
+    await this.scrollList(page, "top");
     for (let steps = 0; steps < 25; steps++) {
-      if (moved) await page.waitForTimeout(250);
       matches = find(await this.extractRows(visibleRows()));
       if (matches.length) return matches;
-      moved = await this.scrollList(page, "next");
+      const moved = await this.scrollList(page, "next");
       if (!moved) break;
     }
     return matches;
@@ -926,41 +980,79 @@ export class Outlook {
 
   private async extract(page: Page, row: Row, id: string) {
     const pane = this.pane(page, row);
-    const findBody = async (visible: boolean) => {
+    await pane.waitFor({ state: "visible" });
+    const findBody = async () => {
       for (const selector of selectors.body) {
-        const candidate = visible ? pane.locator(selector).filter({ visible: true }) : pane.locator(selector);
-        if (await candidate.count()) return candidate;
+        const present = pane.locator(selector);
+        if (await present.evaluateAll(nodes => nodes.some(node => {
+          for (let current: Element | null = node; current; current = current.parentElement) {
+            const style = getComputedStyle(current);
+            if (current.hasAttribute("hidden") || current.getAttribute("aria-hidden") === "true"
+                || style.display === "none" || style.visibility === "hidden") return false;
+          }
+          return true;
+        }))) return present;
       }
     };
     let bodies: Locator | undefined;
     const started = Date.now();
     while (!bodies && Date.now() - started < 8000) {
-      bodies = await findBody(true);
-      // An empty or image-only body has no size, so Playwright never counts it as visible.
-      if (!bodies && Date.now() - started > 2000) bodies = await findBody(false);
+      bodies = await findBody();
       if (!bodies) await page.waitForTimeout(150);
     }
     if (!bodies) throw new MailError("UI_CHANGED", "Could not find the message body in the reading pane.");
     // Outermost bodies only. A conversation shows one body per expanded message.
-    const parts = await bodies.evaluateAll(nodes => {
-      const roots = nodes.filter(node => !nodes.some(other => other !== node && other.contains(node)));
+    const extracted = await bodies.evaluateAll(nodes => {
+      const eligible = nodes.filter(node => {
+        for (let current: Element | null = node; current; current = current.parentElement) {
+          const style = getComputedStyle(current);
+          if (current.hasAttribute("hidden") || current.getAttribute("aria-hidden") === "true"
+              || style.display === "none" || style.visibility === "hidden") return false;
+        }
+        return true;
+      });
+      const roots = eligible.filter(node => !eligible.some(other => other !== node && other.contains(node)));
       const parts: BodyPart[] = [];
-      roots.forEach((root, index) => {
-        if (index) parts.push({ kind: "separator", text: "" });
+      let remaining = 12001;
+      let truncated = false;
+      const take = (text: string) => {
+        let result = "";
+        for (const char of text) {
+          if (remaining <= 0) { truncated = true; break; }
+          result += char;
+          remaining--;
+        }
+        return result;
+      };
+      for (const [index, root] of roots.entries()) {
+        if (truncated) break;
+        if (index) { parts.push({ kind: "separator", text: "" }); remaining -= 5; }
         let buffer = "";
         const flush = (kind: BodyPart["kind"]) => {
-          if (buffer.trim()) parts.push({ kind, text: buffer });
+          if (buffer.trim()) {
+            parts.push({ kind, text: buffer });
+            const clean = buffer.split("\n").map(line => line.replace(/[ \t ]+/g, " ").trim()).join("\n")
+              .replace(/\n{3,}/g, "\n\n").trim();
+            const safe = clean.replace(/[\\`\[\]<>]/g, "\\$&")
+              .replace(/^(\s*)(#{1,6}|[-+*]|\d+[.)])(?=\s)/gm, "$1\\$2")
+              .replace(/^(\s*)(={3,}|-{3,}|_{3,}|\*{3,})\s*$/gm, "$1\\$2");
+            const rendered = kind === "bullet" ? "- " + safe.replace(/\n/g, "\n  ")
+              : kind === "quote" ? safe.split("\n").map(line => "> " + line).join("\n") : safe;
+            remaining += Array.from(buffer).length - Array.from(rendered).length - (parts.length > 1 ? 2 : 0);
+            if (remaining < 0) truncated = true;
+          } else remaining += Array.from(buffer).length;
           buffer = "";
         };
         const walk = (node: Node, kind: BodyPart["kind"]) => {
           for (const child of node.childNodes) {
+            if (truncated) break;
             if (child.nodeType === Node.TEXT_NODE) {
-              buffer += (child.textContent ?? "").replace(/\s+/g, " ");
+              buffer += take((child.textContent ?? "").replace(/\s+/g, " "));
               continue;
             }
             if (child instanceof HTMLImageElement) {
               const alt = child.alt.replace(/\s+/g, " ").trim();
-              if (alt.length > 1 && !child.hidden) buffer += " (image: " + alt + ") ";
+              if (alt.length > 1 && !child.hidden) buffer += take(" (image: " + alt + ") ");
               continue;
             }
             if (!(child instanceof HTMLElement) || child.hidden || child.getAttribute("aria-hidden") === "true" ||
@@ -968,40 +1060,56 @@ export class Outlook {
             const style = getComputedStyle(child);
             if (style.display === "none" || style.visibility === "hidden") continue;
             if (child.tagName === "BR") {
-              buffer += "\n";
+              buffer += take("\n");
               continue;
             }
             // Data tables become "a | b" rows. Layout tables (one cell or nested tables) are walked normally.
             if (child instanceof HTMLTableRowElement && child.cells.length > 1 && !child.querySelector("table")) {
               flush(kind);
-              const cells = Array.from(child.cells, cell => cell.innerText.replace(/\s+/g, " ").trim()).filter(Boolean);
-              if (cells.length) parts.push({ kind: "row", text: cells.join(" | ") });
+              let text = "";
+              for (const cell of child.cells) {
+                const value = cell.innerText.replace(/\s+/g, " ").trim();
+                if (value) text += take((text ? " | " : "") + value);
+                if (truncated) break;
+              }
+              if (text) { buffer = text; flush("row"); }
               continue;
             }
             const block = !style.display.startsWith("inline");
             const inner = child.tagName === "LI" ? "bullet" : child.tagName === "BLOCKQUOTE" ? "quote"
               : child.tagName === "HR" ? "separator" : kind;
             if (block) flush(kind);
-            if (inner === "separator" && kind !== "separator") parts.push({ kind: "separator", text: "" });
+            if (inner === "separator" && kind !== "separator") {
+              parts.push({ kind: "separator", text: "" });
+              remaining -= 5;
+              if (remaining < 0) truncated = true;
+            }
             else walk(child, inner);
             if (block) flush(inner);
           }
         };
         walk(root, "paragraph");
         flush("paragraph");
-      });
-      return parts;
+      }
+      return { parts, truncated };
     });
     // Attachment cards can render after the body. Wait for them only when the row says there are some.
     if (row.hasAttachments) await pane.locator(selectors.attachment).first().waitFor({ timeout: 8000 }).catch(() => {});
-    const attachments = await this.attachmentNames(pane);
-    const recipients = async (selector: string) => {
-      const text = await pane.locator(selector).first().textContent({ timeout: 250 }).catch(() => null);
-      return text?.replace(/^\s*(?:to|cc)\s*:\s*/i, "").replace(/\s+/g, " ").trim() || null;
-    };
-    return { message_id: id, subject: row.subject, sender: row.sender, received_at: row.time || null,
-      to: await recipients(selectors.recipients.to), cc: await recipients(selectors.recipients.cc),
-      attachment_names: attachments, ...formatBody(parts) };
+    const metadata = await pane.evaluate((root, { s, row }) => {
+      const recipients = (selector: string) => root.querySelector(selector)?.textContent
+        ?.replace(/^\s*(?:to|cc)\s*:\s*/i, "").replace(/\s+/g, " ").trim() || null;
+      const attachment_names = Array.from(root.querySelectorAll(s.attachment), (node, index) => {
+        if (node.getAttribute("data-testid") === "attachment-name") return node.textContent?.trim() || "attachment-" + (index + 1);
+        const titled = node.querySelector("[title]")?.getAttribute("title")?.trim();
+        const text = ((node as HTMLElement).innerText ?? "").split("\n")[0].trim();
+        const label = (node.getAttribute("aria-label") ?? "").replace(/\s+Open(?:\s+[\d.,]+\s*[KMGT]?B)?\s*$/i, "").trim();
+        return titled || text || label || "attachment-" + (index + 1);
+      });
+      return { subject: row.subject, sender: row.sender, to: recipients(s.recipients.to), cc: recipients(s.recipients.cc), attachment_names };
+    }, { s: selectors, row });
+    const body = formatBody(extracted.parts);
+    return { message_id: id, ...metadata, received_at: row.time || null,
+      ...body, truncated: body.truncated || extracted.truncated };
   }
 
   async close() {

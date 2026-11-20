@@ -172,6 +172,7 @@ function buildMcp() {
   mcp.registerTool("search_events", {
     description: "List Outlook calendar events shown in day view. start and end are YYYY-MM-DD (end inclusive, defaulting to start, at most 14 days). " +
       "When both are omitted, the day the calendar opens is used. query is an optional case-insensitive substring of the rendered title or location, not Outlook search syntax. " +
+      "Stops scanning after enough matches; scanned_start, scanned_end and stopped_early describe the scanned range, and truncated indicates omitted or unscanned results. " +
       "Returns title, start, end, location and a temporary event_id. Read-only: nothing is created, edited or accepted.",
     inputSchema: {
       start: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),

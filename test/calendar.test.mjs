@@ -212,12 +212,69 @@ test("discards an event editor instead of saving it", async t => {
 });
 
 test("returns EVENT_CHANGED when the opened day no longer shows the event", async t => {
-  let navigations = 0;
-  const { calendar } = await start(t, serve(() => {
-    navigations += 1;
-    return calendarHtml({ drop: navigations > 1 });
-  }));
+  const { context, calendar } = await start(t, serve(calendarHtml()));
   const day = await calendar.search({ start: "2026-11-12", limit: 5 });
+  await calendarTab(context).locator('[data-event-id="evt-maths"]').evaluateAll(nodes => nodes.forEach(node => node.remove()));
+  await assert.rejects(calendar.read(day.events[0].event_id), { code: "EVENT_CHANGED" });
+});
+
+test("reuses a verified day for default searches and reads but verifies live date and events", async t => {
+  let loads = 0;
+  const { context, calendar } = await start(t, serve(() => { loads++; return calendarHtml(); }));
+  const first = await calendar.search();
+  assert.equal(loads, 1, "default search loads the first day only once");
+  await calendar.search({ start: first.start });
+  await calendar.read(first.events[0].event_id);
+  await calendar.read(first.events[1].event_id);
+  assert.equal(loads, 1, "same-day search and reads do not navigate");
+  await calendarTab(context).getByRole("button", { name: "Next day", exact: true }).click();
+  await calendar.search({ start: first.start });
+  assert.equal(loads, 2, "a changed displayed date must be realigned");
+  await calendarTab(context).goto("https://outlook.office.com/mail/");
+  await calendar.read(first.events[0].event_id);
+  assert.equal(loads, 3, "a tab navigated away from calendar must be restored");
+});
+
+test("filters and deduplicates per day before stopping at the result limit", async t => {
+  const loaded = [];
+  const { calendar } = await start(t, serve(url => { loaded.push(url.pathname); return calendarHtml(); }));
+  const first = await calendar.search({ start: "2026-11-12", end: "2026-11-14", limit: 2 });
+  assert.deepEqual(first.events.map(event => event.title), ["Specialist Maths", "Chemistry prac"]);
+  assert.deepEqual([first.start, first.end, first.scanned_start, first.scanned_end, first.stopped_early, first.truncated],
+    ["2026-11-12", "2026-11-14", "2026-11-12", "2026-11-12", true, true]);
+  assert.equal(loaded.length, 1);
+  const hall = await calendar.search({ start: "2026-11-12", end: "2026-11-14", query: "hall", limit: 1 });
+  assert.deepEqual(hall.events.map(event => event.title), ["Assembly"]);
+  assert.equal(hall.scanned_end, "2026-11-13");
+  assert.equal(hall.stopped_early, true);
+  assert.equal(loaded.length, 2, "nonmatching events do not satisfy the limit");
+  const empty = await calendar.search({ start: "2026-11-12", end: "2026-11-14", query: "missing", limit: 1 });
+  assert.deepEqual(empty.events, []);
+  assert.deepEqual([empty.scanned_start, empty.scanned_end, empty.stopped_early, empty.truncated],
+    ["2026-11-12", "2026-11-14", false, false]);
+  const one = await calendar.search({ start: "2026-11-12", limit: 1 });
+  assert.equal(one.stopped_early, false);
+  assert.equal(one.truncated, true, "a completely scanned day may still have omitted hits");
+});
+
+test("snapshots visible metadata, datetime attributes and absent optional event fields", async t => {
+  const html = calendarHtml().replace('<div data-testid="event-where"></div>',
+    '<div data-testid="event-where" style="visibility:hidden"></div><time data-testid="event-start" datetime="custom-start"></time><time data-testid="event-end" datetime="custom-end"></time>');
+  const { calendar } = await start(t, serve(html));
+  const day = await calendar.search();
+  const details = await calendar.read(day.events[1].event_id);
+  assert.equal(details.start, "custom-start");
+  assert.equal(details.end, "custom-end");
+  assert.equal(details.location, "Lab 2", "hidden location falls back to the verified card");
+  assert.equal(details.recurrence, null);
+  assert.deepEqual(details.attendees, []);
+  assert.equal(details.body_markdown, "Safety glasses.");
+});
+
+test("rejects mismatched event peek titles before extracting metadata", async t => {
+  const html = calendarHtml().replace('item.title;', '"Different event";');
+  const { calendar } = await start(t, serve(html));
+  const day = await calendar.search();
   await assert.rejects(calendar.read(day.events[0].event_id), { code: "EVENT_CHANGED" });
 });
 

@@ -4,6 +4,7 @@ import { readdir, mkdtemp, writeFile, stat, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getEventListeners } from 'node:events';
+import { channel } from 'node:diagnostics_channel';
 import { startDownloads } from '../dist/downloads.js';
 
 test('download links preserve bytes, reject other paths and methods, expire and clean up', async () => {
@@ -62,15 +63,29 @@ test('moves files without buffering, preserves bytes and makes the retained copy
   assert.equal((await stat(source)).size, 2);
 });
 
-test('retained-byte quota rejects unserved files and evicts oldest served files under pressure', async t => {
+test('retained-byte quota rejects unserved files and evicts oldest served files under pressure', { timeout: 5000 }, async t => {
   const server = await startDownloads({ host: '127.0.0.1', hostname: '127.0.0.1', port: 0, maxRetainedBytes: 12, allowLoopbackForTest: true });
   t.after(() => server.close());
   const first = await server.save('first', Buffer.from('first!'), 'text/plain');
   const second = await server.save('second', Buffer.from('second'), 'text/plain');
   await assert.rejects(server.save('blocked', Buffer.from('third!'), 'text/plain'), { code: 'STORAGE_FULL' });
   await assert.rejects(server.save('huge', Buffer.alloc(13), 'text/plain'), { code: 'ATTACHMENT_TOO_LARGE' });
+  const finishes = channel('http.server.response.finish');
+  const served = url => new Promise(resolve => {
+    const listener = ({ request }) => {
+      if (request.url !== new URL(url).pathname) return;
+      finishes.unsubscribe(listener);
+      resolve();
+    };
+    finishes.subscribe(listener);
+    t.after(() => finishes.unsubscribe(listener));
+  });
+  const secondServed = served(second.download_url);
   assert.equal(await (await fetch(second.download_url)).text(), 'second');
+  await secondServed;
+  const firstServed = served(first.download_url);
   assert.equal(await (await fetch(first.download_url)).text(), 'first!');
+  await firstServed;
   const third = await server.save('third', Buffer.from('third!'), 'text/plain');
   assert.equal((await fetch(first.download_url)).status, 404, 'oldest creation wins, not last-served order');
   assert.equal(await (await fetch(second.download_url)).text(), 'second');

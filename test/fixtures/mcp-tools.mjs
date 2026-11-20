@@ -29,8 +29,13 @@ Outlook.prototype.search = function (query, limit, signal) {
     }
     this.references.set(id, { query, row: {}, expires: Date.now() + 60000 });
     return { scope: "rendered_search_results", ambiguous_results_omitted: 0,
-      messages: [{ message_id: id, sender: mail.sender, subject: mail.subject, received_at: null, has_attachments: true, snippet: "Fixture" }] };
+      messages: [{ message_id: id, sender: mail.sender, subject: mail.subject, received_at: null, has_attachments: true, snippet: "Fixture", unread: true }] };
   }, signal);
+};
+Outlook.prototype.list = function (folder, limit, unreadOnly, signal) {
+  return this.run(async () => ({ scope: "rendered_folder_list", folder, scan_limit_reached: false, truncated: false,
+    ambiguous_results_omitted: 0, messages: [{ message_id: id, sender: mail.sender, subject: mail.subject,
+      received_at: null, has_attachments: true, snippet: "Fresh fixture", unread: true }] }), signal);
 };
 Outlook.prototype.readOnPage = async function (page, ref, message_id, limit) {
   return { ...mail, message_id, body_markdown: mail.body_markdown.slice(0, limit), truncated: limit < mail.body_markdown.length };

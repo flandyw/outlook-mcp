@@ -15,7 +15,7 @@ export class MailError extends Error {
 export function errorInfo(error: unknown) {
   const code = error instanceof MailError ? error.code : "INTERNAL_ERROR";
   return { code, message: error instanceof MailError ? error.message : "The operation failed.",
-    retryable: ["TIMEOUT", "NETWORK_ERROR", "BROWSER_RESTARTED", "DOWNLOAD_FAILED", "STORAGE_FULL"].includes(code) };
+    retryable: ["TIMEOUT", "UI_CHANGED", "NETWORK_ERROR", "BROWSER_RESTARTED", "DOWNLOAD_FAILED", "STORAGE_FULL"].includes(code) };
 }
 
 /**
@@ -28,8 +28,10 @@ export class SessionLostError extends MailError {
   }
 }
 
-type Row = { index: number; sender: string; subject: string; preview: string; time: string; fingerprint: string; hasAttachments: boolean };
-type Reference = { query: string; row: Row; expires: number };
+export const mailFolders = ["inbox", "sentitems", "drafts", "archive", "junkemail", "deleteditems"] as const;
+type MailFolder = typeof mailFolders[number];
+type Row = { index: number; sender: string; subject: string; preview: string; time: string; fingerprint: string; hasAttachments: boolean; unread?: boolean };
+type Reference = { query: string; folder?: MailFolder; row: Row; expires: number };
 
 // Keep selectors scoped and fail closed when the expected Outlook layout is missing.
 const selectors = {
@@ -84,6 +86,7 @@ function mailMetadata(root: Element, { s, row }: { s: typeof selectors; row: Row
 const temporaryIdMs = 30 * 60_000;
 /** Upper bound for `search_mail`'s limit. Higher values only help when Outlook will render more rows. */
 export const searchResultLimit = 40;
+const mailScrollLimit = 50;
 
 export async function waitForSurface(page: Page, surface: Locator, timeout: number, checkpoint = () => {}) {
   const deadline = Date.now() + timeout;
@@ -112,13 +115,13 @@ function rowKey(row: Row) {
 
 // A stable id carries the query and the Outlook key so read_mail can search again after the
 // in-memory cache expires or the process restarts. Keyless rows keep a random UUID instead.
-function durableMessageId(query: string, row: Row) {
+function durableMessageId(query: string, row: Row, folder?: MailFolder) {
   const key = rowKey(row);
-  if (!key || key.length > 500 || query.length < 1 || query.length > 300) return null;
+  if (!key || key.length > 500 || (!folder && query.length < 1) || query.length > 300) return null;
   if (row.sender.length > 500 || row.subject.length > 500 || row.time.length > 200) return null;
   const encode = (preview: string) => {
     const token = "ow1." + Buffer.from(JSON.stringify({
-      v: 1, q: query, k: key, s: row.sender, j: row.subject, t: row.time,
+      v: 1, q: query, ...(folder ? { f: folder } : {}), k: key, s: row.sender, j: row.subject, t: row.time,
       p: preview, a: row.hasAttachments ? 1 : 0,
     })).toString("base64url");
     return token.length <= 4096 ? token : null;
@@ -136,13 +139,15 @@ function durableReference(id: string): Reference | null {
     return null;
   }
   if (!value || typeof value !== "object") return null;
-  const { v, q, k, s, j, t, p, a } = value as Record<string, unknown>;
+  const { v, q, f, k, s, j, t, p, a } = value as Record<string, unknown>;
+  if (f !== undefined && !mailFolders.includes(f as MailFolder)) return null;
   if (v !== 1 || typeof q !== "string" || typeof k !== "string" || typeof s !== "string" ||
       typeof j !== "string" || typeof t !== "string" || typeof p !== "string" || (a !== 0 && a !== 1)) return null;
-  if (q.length < 1 || q.length > 300 || k.length < 1 || k.length > 500) return null;
+  if ((!f && q.length < 1) || q.length > 300 || k.length < 1 || k.length > 500) return null;
   if (s.length > 500 || j.length > 500 || t.length > 200 || p.length > 2000) return null;
   return {
     query: q,
+    folder: f as MailFolder | undefined,
     expires: Number.POSITIVE_INFINITY,
     row: {
       index: 0, sender: s, subject: j, preview: p, time: t, hasAttachments: a === 1,
@@ -205,11 +210,33 @@ export class Outlook {
   /** Tabs owned by another read-only surface, such as calendar. Mail must not type into them. */
   private reserved = new Set<Page>();
   private queue = Promise.resolve();
-  private operation = new AsyncLocalStorage<() => void>();
+  private operation = new AsyncLocalStorage<{ checkpoint: () => void; retryAllowed: boolean }>();
   private references = new Map<string, Reference>();
 
   checkpoint() {
-    this.operation.getStore()?.();
+    this.operation.getStore()?.checkpoint();
+  }
+
+  preventRetry() {
+    const operation = this.operation.getStore();
+    if (operation) operation.retryAllowed = false;
+  }
+
+  canRetry(error: unknown) {
+    return this.operation.getStore()?.retryAllowed && ["TIMEOUT", "UI_CHANGED", "NETWORK_ERROR", "BROWSER_RESTARTED", "DOWNLOAD_FAILED"]
+      .includes(this.classify(error).code);
+  }
+
+  private async cleanView() {
+    this.checkpoint();
+    for (const page of this.reserved) {
+      await page.close().catch(() => {});
+      this.checkpoint();
+    }
+    this.lastSearchQuery = undefined;
+    const page = await this.ensurePage();
+    await this.ensureMailbox(page, true);
+    this.checkpoint();
   }
 
   status() {
@@ -337,24 +364,34 @@ export class Outlook {
       running = true;
       if (this.busy) throw this.busyError();
       clearTimeout(this.idleTimer);
-      return this.operation.run(checkpoint, async () => {
+      const operation = { checkpoint, retryAllowed: true };
+      return this.operation.run(operation, async () => {
       try {
         this.recoveryTried = false;
         const attempt = async () => {
-          const page = await this.ensurePage();
-          checkpoint();
-          try {
-            const value = await work(page);
-            checkpoint();
-            return value;
-          } catch (error) {
-            checkpoint();
-            if (!await this.sessionLost(page, error)) throw error;
-            // Microsoft signed the browser out mid-operation. Recover once, then repeat the work.
-            console.error("outlook-mcp: the Microsoft session ended during a request; signing back in.");
-            await this.ensureMailbox(page, true);
-            checkpoint();
-            return await work(page);
+          for (;;) {
+            let page: Page | undefined;
+            try {
+              page = await this.ensurePage();
+              checkpoint();
+              const value = await work(page);
+              checkpoint();
+              return value;
+            } catch (error) {
+              checkpoint();
+              if (operation.retryAllowed && page && (error instanceof SessionLostError || !(error instanceof MailError) || this.canRetry(error))
+                  && await this.sessionLost(page, error)) {
+                operation.retryAllowed = false;
+                console.error("outlook-mcp: the Microsoft session ended during a request; signing back in.");
+                await this.ensureMailbox(page, true);
+                checkpoint();
+                continue;
+              }
+              if (!this.canRetry(error)) throw error;
+              operation.retryAllowed = false;
+              if (this.classify(error).code === "BROWSER_RESTARTED") await this.shutdownBrowser();
+              await this.cleanView();
+            }
           }
         };
         const value = await Promise.race([attempt(), stuck]);
@@ -639,8 +676,35 @@ export class Outlook {
     }
   }
 
-  private resultList(page: Page) {
-    return searchRegion(page).locator(selectors.results).filter({ visible: true });
+  private resultRegion(page: Page, folder?: MailFolder) {
+    return folder ? page.locator('#MailList, [data-testid="folder-results"], [aria-label="Message list"]')
+      .filter({ visible: true }).first() : searchRegion(page);
+  }
+
+  private resultList(page: Page, folder?: MailFolder) {
+    return this.resultRegion(page, folder).locator(selectors.results).filter({ visible: true });
+  }
+
+  private async showingFolder(page: Page, folder: MailFolder) {
+    if (!outlookOrigins.has(safeOrigin(page.url())) || !new RegExp("/mail/(?:u/\\d+/)?" + folder + "/?$").test(new URL(page.url()).pathname)) return false;
+    const box = page.locator("#topSearchInput").or(page.getByRole("searchbox")).first();
+    return await box.inputValue({ timeout: 500 }).catch(() => null) === "";
+  }
+
+  private async folderRows(page: Page, folder: MailFolder) {
+    await this.ensureMailbox(page);
+    this.checkpoint();
+    const origin = outlookOrigins.has(safeOrigin(page.url())) ? new URL(page.url()).origin : mailbox.origin;
+    this.lastSearchQuery = undefined;
+    await page.goto(origin + "/mail/" + folder + "/", { waitUntil: "domcontentloaded", timeout: 30000 });
+    await this.ensureMailbox(page);
+    if (!await this.showingFolder(page, folder)) throw new MailError("UI_CHANGED", "Could not verify the live folder view and cleared search.");
+    const empty = page.getByText(/^(?:no (?:items|messages)(?: to show)?|this folder is empty|nothing in (?:this folder|here))[.!]?$/i).filter({ visible: true }).first();
+    const candidates = this.resultList(page, folder);
+    await candidates.first().or(empty).first().waitFor().catch(() => {
+      throw new MailError("UI_CHANGED", "Could not identify the Outlook folder list.");
+    });
+    return await empty.isVisible() ? [] : this.extractRows(candidates);
   }
 
   private async rows(page: Page, query: string): Promise<Row[]> {
@@ -727,7 +791,9 @@ export class Outlook {
       const fingerprint = JSON.stringify([key, sender, subject, time, preview]);
       // Outlook's row label says "Has attachments" (or similar) for messages with files.
       const hasAttachments = /\battach/i.test(node.getAttribute("aria-label") ?? "");
-      return [{ index, sender, subject, preview, time, fingerprint, hasAttachments }];
+      const unread = /^\s*unread\b/i.test(node.getAttribute("aria-label") ?? "") || [...node.querySelectorAll("[aria-label]")]
+        .some(element => /^\s*unread\s*$/i.test(element.getAttribute("aria-label") ?? ""));
+      return [{ index, sender, subject, preview, time, fingerprint, hasAttachments, unread }];
     }), selectors);
   }
 
@@ -744,47 +810,80 @@ export class Outlook {
    * Collect identifiable rows from the top of the result list until `limit` hits are available or
    * Outlook stops rendering more. Virtualized lists only keep a window of rows in the DOM.
    */
-  private async gatherRows(page: Page, query: string, limit: number) {
-    const seeded = await this.rows(page, query);
-    if (!seeded.length) return seeded;
+  private async gatherRows(page: Page, query: string, limit: number, folder?: MailFolder) {
+    const seeded = folder ? await this.folderRows(page, folder) : await this.rows(page, query);
+    if (!seeded.length) return { rows: seeded, scan_limit_reached: false };
     const collected: Row[] = [];
-    const seen = new Set<string>();
+    const seen = new Map<string, number>();
     const add = (list: Row[]) => {
       // Keep every copy from this window so duplicate top/all-results rows still collapse later,
       // but don't count the same row again after the next scroll.
-      const fresh = list.filter(row => !seen.has(row.fingerprint));
-      collected.push(...fresh);
-      for (const row of list) seen.add(row.fingerprint);
+      const counts = new Map<string, number>();
+      for (const row of list) {
+        const count = (counts.get(row.fingerprint) ?? 0) + 1;
+        counts.set(row.fingerprint, count);
+        if (count > (seen.get(row.fingerprint) ?? 0)) collected.push(row);
+      }
+      for (const [fingerprint, count] of counts) seen.set(fingerprint, Math.max(count, seen.get(fingerprint) ?? 0));
     };
-    await this.scrollList(page, "top");
-    add(await this.extractRows(this.resultList(page)));
+    await this.scrollList(page, "top", folder);
+    add(await this.extractRows(this.resultList(page, folder)));
     let stuck = 0;
-    for (let step = 0; step < 50 && this.hitsFrom(collected).length < limit; step++) {
-      const moved = await this.scrollList(page, "next");
+    let step = 0;
+    for (; step < mailScrollLimit && this.hitsFrom(collected).length < limit; step++) {
+      const moved = await this.scrollList(page, "next", folder);
       if (!moved) break;
       const before = collected.length;
-      add(await this.extractRows(this.resultList(page)));
+      add(await this.extractRows(this.resultList(page, folder)));
       if (collected.length === before) {
         if (++stuck >= 3) break;
       } else stuck = 0;
     }
-    return collected;
+    return { rows: collected, scan_limit_reached: step === mailScrollLimit || stuck >= 3 };
+  }
+
+  list(folder: MailFolder = "inbox", limit = 10, unreadOnly = false, signal?: AbortSignal) {
+    if (!mailFolders.includes(folder) || !Number.isInteger(limit) || limit < 1 || limit > searchResultLimit) {
+      throw new MailError("INVALID_RANGE", "Pass a well-known folder and an integer limit from 1 to 40.");
+    }
+    return this.run(async page => {
+      const { rows, scan_limit_reached } = await this.gatherRows(page, "", Infinity, folder);
+      const identifiable = this.hitsFrom(rows);
+      const hits = identifiable.filter(row => !unreadOnly || row.unread);
+      const dated = hits.filter(row => Number.isFinite(Date.parse(row.time)));
+      dated.sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+      let dateIndex = 0;
+      const ordered = hits.map(row => Number.isFinite(Date.parse(row.time)) ? dated[dateIndex++] : row);
+      const messages = ordered.slice(0, limit).map(row => {
+        const message_id = durableMessageId("", row, folder) ?? randomUUID();
+        this.references.set(message_id, { query: "", folder, row, expires: Date.now() + (this.options.referenceTtlMs ?? temporaryIdMs) });
+        return { message_id, sender: row.sender, subject: row.subject, received_at: row.time || null,
+          has_attachments: row.hasAttachments, snippet: row.preview.slice(0, 300), unread: row.unread ?? false };
+      });
+      this.pruneReferences();
+      return { messages, folder, scope: "rendered_folder_list" as const, scan_limit_reached,
+        truncated: scan_limit_reached || hits.length > limit, ambiguous_results_omitted: rows.length - identifiable.length };
+    }, signal);
+  }
+
+  private pruneReferences() {
+    for (const [id, reference] of this.references) {
+      if (reference.expires <= Date.now() || this.references.size > 500) this.references.delete(id);
+    }
   }
 
   search(query: string, limit: number, signal?: AbortSignal) {
     return this.run(async page => {
-      const rows = await this.gatherRows(page, query, limit);
+      const { rows } = await this.gatherRows(page, query, limit);
       const hits = this.hitsFrom(rows);
       const ttl = this.options.referenceTtlMs ?? temporaryIdMs;
       const messages = hits.slice(0, limit).map(row => {
         const message_id = durableMessageId(query, row) ?? randomUUID();
         this.references.set(message_id, { query, row, expires: Date.now() + ttl });
         return { message_id, sender: row.sender, subject: row.subject, received_at: row.time || null,
-          has_attachments: row.hasAttachments, snippet: row.preview.slice(0, 300) };
+          has_attachments: row.hasAttachments, snippet: row.preview.slice(0, 300), unread: row.unread ?? false };
       });
-      for (const [id, reference] of this.references) {
-        if (reference.expires <= Date.now() || this.references.size > 500) this.references.delete(id);
-      }
+      this.pruneReferences();
       const omitted = rows.filter(row => !hits.some(hit => hit.fingerprint === row.fingerprint)).length;
       return { messages, scope: "rendered_search_results", ambiguous_results_omitted: omitted };
     }, signal);
@@ -805,7 +904,8 @@ export class Outlook {
     if (reference.expires <= Date.now()) {
       throw new MailError("UNKNOWN_MESSAGE", "Run search_mail again to get a fresh message ID.");
     }
-    const visibleRows = () => this.resultList(page);
+    if (reference.folder === "drafts") throw new MailError("DRAFT_UNAVAILABLE", "Drafts cannot be opened safely without entering the composer.");
+    const visibleRows = () => this.resultList(page, reference.folder);
     const sameMessage = (row: Row) => {
       if (row.fingerprint === reference.row.fingerprint) return true;
       const [key] = JSON.parse(row.fingerprint);
@@ -819,15 +919,16 @@ export class Outlook {
       const exact = rows.filter(row => row.fingerprint === reference.row.fingerprint);
       return exact.length ? exact : rows.filter(sameMessage);
     };
-    let matches = this.lastSearchQuery === reference.query && await this.showingSearch(page, reference.query)
-      ? await this.scrollToFind(page, find)
+    let matches = (reference.folder ? await this.showingFolder(page, reference.folder)
+      : this.lastSearchQuery === reference.query && await this.showingSearch(page, reference.query))
+      ? await this.scrollToFind(page, find, reference.folder)
       : [];
     if (matches.length !== 1) {
       // Run the search again for real: rows() would otherwise hand back the same cached list.
       this.lastSearchQuery = undefined;
-      const rows = await this.rows(page, reference.query);
+      const rows = reference.folder ? await this.folderRows(page, reference.folder) : await this.rows(page, reference.query);
       matches = find(rows);
-      if (!matches.length) matches = await this.scrollToFind(page, find);
+      if (!matches.length) matches = await this.scrollToFind(page, find, reference.folder);
       if (!matches.length && reference.row.time) {
         matches = rows.filter(row => row.sender === reference.row.sender && row.subject === reference.row.subject &&
           row.time === reference.row.time && row.preview === reference.row.preview);
@@ -852,6 +953,7 @@ export class Outlook {
     }
     const wasUnread = await this.rowWasUnread(candidate);
     this.checkpoint();
+    if (wasUnread) this.preventRetry();
     const clicked = await candidate.evaluate(async (node, { s, fingerprint }) => {
       const text = (selector: string) => node.querySelector(selector)?.textContent?.trim() ?? "";
       const timeNode = node.querySelector("time");
@@ -889,9 +991,9 @@ export class Outlook {
   }
 
   // Moves the list's scroll container: "top" resets it, "next" advances most of a screen. Returns false at the end.
-  private scrollList(page: Page, step: "top" | "next") {
+  private scrollList(page: Page, step: "top" | "next", folder?: MailFolder) {
     this.checkpoint();
-    return searchRegion(page).evaluate(async (root, { step, results }) => {
+    return this.resultRegion(page, folder).evaluate(async (root, { step, results }) => {
       const scrollable = [root, ...root.querySelectorAll("*")].find(element =>
         element.scrollHeight > element.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(element).overflowY));
       if (!scrollable) return false;
@@ -916,15 +1018,16 @@ export class Outlook {
    * Outlook virtualizes the message list: only rows near the viewport exist in the page, and opening
    * messages scrolls the list. Look at the rendered rows, then page through the list from the top.
    */
-  private async scrollToFind(page: Page, find: (rows: Row[]) => Row[]) {
-    const visibleRows = () => this.resultList(page);
+  private async scrollToFind(page: Page, find: (rows: Row[]) => Row[], folder?: MailFolder) {
+    const visibleRows = () => this.resultList(page, folder);
     let matches = find(await this.extractRows(visibleRows()));
     if (matches.length) return matches;
-    await this.scrollList(page, "top");
-    for (let steps = 0; steps < 25; steps++) {
+    await this.scrollList(page, "top", folder);
+    for (let steps = 0; steps <= mailScrollLimit; steps++) {
       matches = find(await this.extractRows(visibleRows()));
       if (matches.length) return matches;
-      const moved = await this.scrollList(page, "next");
+      if (steps === mailScrollLimit) break;
+      const moved = await this.scrollList(page, "next", folder);
       if (!moved) break;
     }
     return matches;
@@ -984,9 +1087,11 @@ export class Outlook {
         this.checkpoint();
         try {
           results.push({ message_id, data: await this.readOnPage(page, this.reference(message_id), message_id, maxBodyChars) });
+          this.preventRetry();
         } catch (error) {
           this.checkpoint();
           if (await this.sessionLost(page, error)) throw error;
+          if (this.canRetry(error)) throw error;
           results.push({ message_id, error: errorInfo(this.classify(error)) });
         }
       }
@@ -1059,6 +1164,7 @@ export class Outlook {
           throw new MailError("ATTACHMENT_UNAVAILABLE", "Outlook offers no download for this attachment (it may be a cloud link).");
         }
         const item = items.nth(position);
+        this.preventRetry();
         const [download] = await Promise.all([page.waitForEvent("download", { timeout: 60_000 }), item.click()]);
         try {
           this.checkpoint();

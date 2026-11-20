@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
 import { launchChromium } from "./chromium.mjs";
-import { Outlook, waitForSurface } from "../dist/outlook.js";
+import { Outlook, MailError, waitForSurface } from "../dist/outlook.js";
 import { toolContracts } from "../dist/tool-contracts.js";
 import { startDownloads } from "../dist/downloads.js";
 
@@ -151,6 +151,12 @@ test("reads the real body, recipients and attachments from the modern layout", a
     return consume(file);
   });
   assert.equal(byName.data.toString(), "Plan body");
+  let consumed = 0;
+  await assert.rejects(outlook.downloadAttachment(id, 0, 4 * 1024 * 1024, async () => {
+    consumed++;
+    throw new MailError("UI_CHANGED", "failure after saving");
+  }), { code: "UI_CHANGED" });
+  assert.equal(consumed, 1, "never replay a download/save side effect");
   await assert.rejects(stat(downloadPath), { code: "ENOENT" });
   await assert.rejects(outlook.downloadAttachment(id, "missing.doc", 1024), { code: "UNKNOWN_ATTACHMENT", message: /notes\.txt/ });
   await assert.rejects(outlook.downloadAttachment(id, 7, 1024), { code: "UNKNOWN_ATTACHMENT" });
@@ -310,11 +316,12 @@ test("reads empty and image-only bodies without polling for visible body dimensi
   const browser = await launchChromium();
   t.after(() => browser.close());
   const context = await browser.newContext();
+  let omitBody = false;
   await context.route("https://outlook.office.com/**", route => route.fulfill({ contentType: "text/html", body: `
     <input type="search" aria-label="Search"><section aria-label="Search results" hidden>
     <div role="listbox"><div role="option" data-item-id="body-test"><span data-testid="sender">Ada</span>
     <span data-testid="subject">Body test</span></div></div></section>
-    <section aria-label="Reading Pane" hidden><h2>Body test</h2><div id="UniqueMessageBody_1"></div></section>
+    <section aria-label="Reading Pane" hidden><h2>Body test</h2>${omitBody ? "" : '<div id="UniqueMessageBody_1"></div>'}</section>
     <script>
     document.querySelector('input').onkeydown = e => { if(e.key==='Enter') document.querySelector('section').hidden=false; };
     document.querySelector('[role=option]').onclick = () => {document.querySelector('[aria-label="Reading Pane"]').hidden=false;};
@@ -379,6 +386,7 @@ test("reads empty and image-only bodies without polling for visible body dimensi
       '<div id="UniqueMessageBody_1"><p>Delayed body</p><div hidden>Hidden body</div></div>'); }, 30);
   });
   assert.equal((await outlook.read(id)).body_markdown, "Delayed body");
+  omitBody = true;
   await page.locator('#UniqueMessageBody_1').evaluate(node => node.remove());
   await assert.rejects(outlook.read(id), { code: "UI_CHANGED" });
   await outlook.close();
@@ -488,7 +496,15 @@ test("keeps stable ids usable after expiry and restart, and temporary ids until 
   assert.notEqual(bySubject(again, "Temporary note").message_id, temporary);
   assert.deepEqual(await flags(), { restored: 0, bodyClicks: 0 });
   // A subject that merely contains the word is not an unread status, so the toolbar button stays unclicked.
+  const extract = outlook.extract.bind(outlook);
+  let attempts = 0;
+  outlook.extract = (...args) => {
+    if (++attempts === 1) throw new MailError("UI_CHANGED", "transient reading pane");
+    return extract(...args);
+  };
   assert.equal((await outlook.read(bySubject(hits, "Unread books are due").message_id)).body_markdown, "Body Unread books are due");
+  assert.equal(attempts, 2);
+  outlook.extract = extract;
   assert.deepEqual(await flags(), { restored: 0, bodyClicks: 0 });
   const durable = await outlook.read(stable);
   assert.equal(durable.body_markdown, "Body Durable note");
@@ -514,4 +530,10 @@ test("keeps stable ids usable after expiry and restart, and temporary ids until 
   assert.equal((await short.read(shortStable)).subject, "Durable note");
   await assert.rejects(short.read(shortTemporary), { code: "UNKNOWN_MESSAGE" });
   assert.equal((await outlook.read(temporary)).subject, "Temporary note");
+  const before = await flags();
+  let failedReads = 0;
+  outlook.extract = async () => { failedReads++; throw new MailError("UI_CHANGED", "failure after marking read"); };
+  await assert.rejects(outlook.read(stable), { code: "UI_CHANGED" });
+  assert.equal(failedReads, 1);
+  assert.deepEqual(await flags(), { restored: before.restored + 1, bodyClicks: 0 }, "unread cleanup runs once without replaying the read");
 });

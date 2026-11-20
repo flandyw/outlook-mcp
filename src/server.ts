@@ -134,6 +134,10 @@ function buildMcp() {
       "Message IDs that start with ow1. stay valid across restarts when the result row had an Outlook item or conversation id. Event IDs and other message IDs expire after 30 minutes.",
   });
   mcp.server.setNotificationHandler(CancelledNotificationSchema, notification => cancelRequest(notification.params.requestId));
+  mcp.registerTool("list_mail", toolContracts.list_mail, ({ folder, limit, unread_only }, extra) => cancellable(extra, signal =>
+    result(() => outlook.list(folder, limit, unread_only, signal), data =>
+      `${data.messages.length} live ${folder} rows; ${data.ambiguous_results_omitted} ambiguous rows omitted; truncated: ${data.truncated}; scan cap reached: ${data.scan_limit_reached}.\n` +
+      data.messages.map(m => `${m.message_id}: ${m.unread ? "[unread] " : ""}${m.subject} — ${m.sender} (${m.received_at ?? "date not shown"})\n${m.snippet}`).join("\n"))));
   mcp.registerTool("search_mail", toolContracts.search_mail, ({ query, limit }, extra) => cancellable(extra, signal => result(() => outlook.search(query, limit, signal),
     data => `${data.messages.length} identifiable mail rows for "${query}"; ${data.ambiguous_results_omitted} ambiguous rows omitted.\n` +
       data.messages.map(m => `${m.message_id}: ${m.subject} — ${m.sender} (${m.received_at ?? "date not shown"})\n${m.snippet}`).join("\n"))));

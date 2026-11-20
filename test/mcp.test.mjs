@@ -45,7 +45,7 @@ test("serves read-only mail and calendar tools over authenticated Streamable HTT
   t.after(() => client.close());
   await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers } }));
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map(tool => tool.name), ["search_mail", "read_mail", "read_mails", "read_attachment", "mail_status", "search_events", "read_event", "read_events"]);
+  assert.deepEqual(tools.map(tool => tool.name), ["list_mail", "search_mail", "read_mail", "read_mails", "read_attachment", "mail_status", "search_events", "read_event", "read_events"]);
   assert.ok(tools.every(tool => tool.annotations.readOnlyHint));
   assert.ok(tools.every(tool => tool.annotations.destructiveHint === false));
   for (const tool of tools) {
@@ -144,6 +144,10 @@ test("serves read-only mail and calendar tools over authenticated Streamable HTT
   await chmod(password, 0o600);
   await assert.rejects(callControl("POST", "/login", { display: {} }), { code: "NO_DISPLAY" });
   const found = await client.callTool({ name: "search_mail", arguments: { query: "fixture" } });
+  const listed = await client.callTool({ name: "list_mail", arguments: {} });
+  assert.equal(listed.structuredContent.folder, "inbox");
+  assert.equal(listed.structuredContent.messages[0].unread, true);
+  assert.equal((await client.callTool({ name: "list_mail", arguments: { folder: "../calendar" } })).isError, true);
   assert.ok(!found.isError);
   const message_id = found.structuredContent.messages[0].message_id;
   const read = await client.callTool({ name: "read_mail", arguments: { message_id, max_body_chars: 5 } });

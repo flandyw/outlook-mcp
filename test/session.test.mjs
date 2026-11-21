@@ -269,6 +269,21 @@ test("distinguishes a failed automatic sign-in from the cooldown that follows", 
   });
 });
 
+test("discards the browser after a Playwright navigation timeout", async t => {
+  const launcher = await harness(t, route => route.fulfill({ contentType: "text/html", body: mailboxPage }));
+  const outlook = new Outlook(launcher);
+  await outlook.check();
+  const page = launcher.contexts[0].pages()[0];
+  // Trigger the same native TimeoutError as page.goto without a slow live network.
+  const timeout = await page.locator("#missing").waitFor({ timeout: 20 }).catch(error => error);
+  page.goto = async () => { throw timeout; };
+  await assert.rejects(outlook.openSignIn(), { code: "TIMEOUT" });
+  assert.equal(outlook.status().browser, "stopped");
+  await outlook.check();
+  assert.equal(launcher.count, 2);
+  await outlook.close();
+});
+
 // Microsoft's password page: accepts "fixture-password" for fixture@example.com, otherwise shows the classic error.
 const passwordPage = `<form><p>fixture@example.com</p><div id="passwordError" hidden>Your account or password is incorrect.</div>
   <input type="password" name="passwd"><input type="submit" id="idSIButton9"></form>

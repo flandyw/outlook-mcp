@@ -633,7 +633,7 @@ export class Outlook {
           continue;
         }
         this.signInBlockedUntil = Date.now() + 2 * 60_000;
-        this.signInBlockedReason = "Automatic sign-in is cooling down after a recent attempt.";
+        this.signInBlockedReason = message + " Automatic sign-in is cooling down after a recent attempt.";
         throw new MailError("AUTH_REQUIRED", message + " " + signInHelp);
       }
     }

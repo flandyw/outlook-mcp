@@ -439,7 +439,8 @@ for (const succeeds of [true, false]) {
       } else {
         await assert.rejects(outlook.check(), { code: "AUTH_REQUIRED", message: /credentials: browser timeout/ });
         assert.match(outlook.status().last_error.message, /browser timeout/);
-        await assert.rejects(outlook.check(), { code: "AUTH_REQUIRED", message: /cooling down/ });
+        await assert.rejects(outlook.check(), { code: "AUTH_REQUIRED", message: /browser timeout.*cooling down/ });
+        assert.match(outlook.status().last_error.message, /credentials: browser timeout/);
       }
       assert.equal(base.count, 2);
       assert.equal(base.contexts[0].pages().length, 0);

@@ -378,3 +378,110 @@ test("refuses both OUTLOOK_PASSWORD and OUTLOOK_PASSWORD_FILE", async t => {
     await assert.rejects(outlook.check(), { code: "AUTH_REQUIRED", message: /only one of OUTLOOK_PASSWORD and OUTLOOK_PASSWORD_FILE/ });
   });
 });
+
+test("automatic sign-in diagnostics contain only allowlisted details", async () => {
+  const { automaticSignInDiagnostic } = await import("../dist/outlook.js");
+  const secret = "password token cookie .env https://webhook.example/secret?sender_key=canary";
+  for (const [message, name, kind, transient] of [
+    ["locator.fill: Timeout " + secret, "TimeoutError", "browser timeout", true],
+    ["page.goto: net::ERR_CONNECTION_RESET " + secret, "Error", "browser network error", true],
+    ["Target page, context or browser has been closed " + secret, "Error", "browser or page closed", true],
+    [secret, "Error", "unclassified browser failure", false],
+  ]) {
+    const error = new Error(message, { cause: secret });
+    error.name = name;
+    assert.deepEqual(automaticSignInDiagnostic(error), { kind, transient });
+  }
+});
+
+for (const succeeds of [true, false]) {
+  test("fresh context automatic sign-in retry " + (succeeds ? "succeeds" : "fails once then cools down"), async t => {
+    const state = {};
+    const base = await signInHarness(t, state);
+    const logs = [];
+    const original = console.error;
+    console.error = (...args) => logs.push(args.join(" "));
+    t.after(() => { console.error = original; });
+    const launcher = async () => {
+      const context = await base();
+      if (base.count === 1 || !succeeds) {
+        const newPage = context.newPage.bind(context);
+        context.newPage = async () => {
+          const page = await newPage();
+          const locator = page.locator.bind(page);
+          page.locator = (...args) => {
+            const result = locator(...args);
+            if (String(args[0]).includes('name="passwd"')) {
+              const first = result.first.bind(result);
+              result.first = () => {
+                const input = first();
+                input.fill = async () => {
+                  const error = new Error("locator.fill: secret-password https://webhook/secret?token=canary");
+                  error.name = "TimeoutError";
+                  throw error;
+                };
+                return input;
+              };
+            }
+            return result;
+          };
+          return page;
+        };
+      }
+      return context;
+    };
+    await withEnv({ OUTLOOK_USERNAME: "fixture@example.com", OUTLOOK_PASSWORD: "fixture-password", OUTLOOK_PASSWORD_FILE: undefined }, async () => {
+      const outlook = new Outlook(launcher, { readyMs: 2000 });
+      t.after(() => outlook.close());
+      if (succeeds) {
+        assert.deepEqual((await outlook.search("nothing", 5)).messages, []);
+        assert.equal(outlook.status().auth, "signed_in");
+      } else {
+        await assert.rejects(outlook.check(), { code: "AUTH_REQUIRED", message: /credentials: browser timeout/ });
+        assert.match(outlook.status().last_error.message, /browser timeout/);
+        await assert.rejects(outlook.check(), { code: "AUTH_REQUIRED", message: /browser timeout.*cooling down/ });
+        assert.match(outlook.status().last_error.message, /credentials: browser timeout/);
+      }
+      assert.equal(base.count, 2);
+      assert.equal(base.contexts[0].pages().length, 0);
+      assert.doesNotMatch(logs.join("\n") + JSON.stringify(outlook.status()), /secret-password|webhook|canary/);
+      assert.match(logs.join("\n"), /credentials: browser timeout/);
+    });
+  });
+}
+
+test("terminal automatic sign-in failures never launch a fresh context", async t => {
+  for (const problem of ["password_rejected", "account_rejected", "account_locked", "second_factor"]) {
+    const { SignInError } = await import("../dist/reauth.js");
+    const { automaticSignInDiagnostic } = await import("../dist/outlook.js");
+    assert.equal(automaticSignInDiagnostic(new SignInError(problem, "secret")).transient, false);
+    // Exercise the recovery controller with a deterministic page that fails while resuming.
+    const page = { url: () => "https://login.microsoftonline.com/", locator() { throw new SignInError(problem, "secret"); } };
+    let launches = 0;
+    const outlook = new Outlook(async () => { launches++; throw new Error("must not launch"); });
+    await assert.rejects(outlook.recoverSession(page), { code: "AUTH_REQUIRED" });
+    assert.equal(launches, 0);
+    assert.ok(outlook.signInBlockedUntil > Date.now());
+    await assert.rejects(outlook.recoverSession(page), { code: "AUTH_REQUIRED", message: /paused/ });
+    assert.equal(launches, 0);
+  }
+});
+
+test("fresh-context launch failures are sanitized and do not loop", async () => {
+  const page = { url: () => "https://login.microsoftonline.com/", locator() {
+    const error = new Error("secret fill value");
+    error.name = "TimeoutError";
+    throw error;
+  } };
+  let launches = 0;
+  const outlook = new Outlook(async () => {
+    launches++;
+    throw new Error("launch https://webhook/secret?token=canary");
+  });
+  await assert.rejects(outlook.recoverSession(page), {
+    code: "AUTH_REQUIRED", message: /launch_context: unclassified browser failure/,
+  });
+  assert.equal(launches, 1);
+  await assert.rejects(outlook.recoverSession(page), { message: /cooling down/ });
+  assert.equal(launches, 1);
+});

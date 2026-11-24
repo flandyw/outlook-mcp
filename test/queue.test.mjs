@@ -176,3 +176,53 @@ test("active cancellation stops at checkpoints without releasing the queue befor
   assert.equal(outlook.status().browser, "running");
   assert.equal(getEventListeners(controller.signal, "abort").length, 0);
 });
+
+async function replacementSignal(t) {
+  const outlook = new Outlook(async () => {
+    const fresh = context();
+    fresh.pages()[0].goto = async () => {};
+    return fresh;
+  });
+  t.after(() => outlook.close());
+  const stale = { url: () => "https://login.microsoftonline.com/", locator() {
+    const error = new Error("fixture timeout");
+    error.name = "TimeoutError";
+    throw error;
+  } };
+  try { await outlook.recoverSession(stale); }
+  catch (error) { assert.equal(error.constructor.name, "RecoveredWithFreshPage"); return error; }
+  assert.fail("expected fresh-page replacement signal");
+}
+
+test("retry cleanup consumes fresh-page recovery without restoring the ordinary retry allowance", async t => {
+  const signal = await replacementSignal(t);
+  const outlook = new Outlook(async () => context());
+  t.after(() => outlook.close());
+  outlook.ensureMailbox = async () => {};
+  outlook.sessionLost = async () => false;
+  let clean = 0, calls = 0;
+  outlook.cleanView = async () => { clean++; throw signal; };
+  assert.equal(await outlook.useBrowser(async () => {
+    if (++calls === 1) throw new MailError("UI_CHANGED", "fixture");
+    return "recovered";
+  }), "recovered");
+  assert.equal(clean, 1);
+  assert.equal(calls, 2);
+});
+
+test("batch reads propagate fresh-page recovery instead of returning an item error", async t => {
+  const signal = await replacementSignal(t);
+  const outlook = new Outlook(async () => context());
+  t.after(() => outlook.close());
+  outlook.reference = id => ({ id });
+  outlook.sessionLost = async () => false;
+  let calls = 0;
+  outlook.readOnPage = async () => {
+    if (++calls === 1) throw signal;
+    return { subject: "fixture" };
+  };
+  assert.deepEqual(await outlook.readMails(["fixture-id"]), {
+    results: [{ message_id: "fixture-id", data: { subject: "fixture" } }],
+  });
+  assert.equal(calls, 2);
+});

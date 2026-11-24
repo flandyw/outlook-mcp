@@ -16,6 +16,33 @@ export const draftInput = z.object({
   reply_mode: z.enum(["reply", "reply_all"]).default("reply").describe("Reply or Reply all when replying (default reply); never sends."),
 });
 
+/** Never forward raw Playwright messages, call logs, selectors, URLs or causes. */
+export function automaticSignInDiagnostic(error: unknown) {
+  if (error instanceof SignInError) {
+    const kinds = {
+      password_rejected: "Microsoft rejected the configured password",
+      account_rejected: "Microsoft did not recognise the configured account",
+      account_locked: "Microsoft reports the account is locked",
+      second_factor: "Microsoft asked for MFA or another verification step",
+      stuck: "sign-in did not complete",
+    };
+    return { kind: kinds[error.problem], transient: error.problem === "stuck" };
+  }
+  if (error instanceof PasswordFileError) return { kind: "password file configuration error", transient: false };
+  if (error instanceof ProfileLockedError) return { kind: "persistent profile locked", transient: false };
+  const message = error instanceof Error ? error.message : "";
+  if (error instanceof Error && error.name === "TimeoutError") return { kind: "browser timeout", transient: true };
+  if (/net::ERR_(?:INTERNET_DISCONNECTED|NAME_NOT_RESOLVED|NAME_RESOLUTION_FAILED|CONNECTION_RESET|CONNECTION_CLOSED|CONNECTION_REFUSED|NETWORK_CHANGED|TIMED_OUT)\b/.test(message)) {
+    return { kind: "browser network error", transient: true };
+  }
+  if (/has been closed|browser.*(?:closed|disconnected)|Target crashed/i.test(message)) {
+    return { kind: "browser or page closed", transient: true };
+  }
+  return { kind: "unclassified browser failure", transient: false };
+}
+
+class RecoveredWithFreshPage extends Error {}
+
 export class MailError extends Error {
   constructor(readonly code: string, message: string) {
     super(message);
@@ -212,6 +239,7 @@ export class Outlook {
   private signInBlockedReason?: string;
   /** Set when the current operation already tried to recover the session. */
   private recoveryTried = false;
+  private freshSignInRetryTried = false;
   private lastSearchQuery?: string;
   private loadedAt = 0;
   private idleTimer?: NodeJS.Timeout;
@@ -378,6 +406,7 @@ export class Outlook {
       return this.operation.run(operation, async () => {
       try {
         this.recoveryTried = false;
+        this.freshSignInRetryTried = false;
         const attempt = async () => {
           for (;;) {
             let page: Page | undefined;
@@ -389,11 +418,16 @@ export class Outlook {
               return value;
             } catch (error) {
               checkpoint();
+              if (error instanceof RecoveredWithFreshPage) continue;
               if (operation.retryAllowed && page && (error instanceof SessionLostError || !(error instanceof MailError) || this.canRetry(error))
                   && await this.sessionLost(page, error)) {
                 operation.retryAllowed = false;
                 console.error("outlook-mcp: the Microsoft session ended during a request; signing back in.");
-                await this.ensureMailbox(page, true);
+                try {
+                  await this.ensureMailbox(page, true);
+                } catch (recoveryError) {
+                  if (!(recoveryError instanceof RecoveredWithFreshPage)) throw recoveryError;
+                }
                 checkpoint();
                 continue;
               }
@@ -536,50 +570,72 @@ export class Outlook {
     if (!isMicrosoftLogin(page)) return;
     this.recoveryTried = true;
     const username = process.env.OUTLOOK_USERNAME;
-    // A remembered account usually signs in again without a secret.
-    const resumed = await resumeSignIn(page, username).catch(() => "needs_user" as const);
-    if (resumed === "signed_in") {
-      console.error("outlook-mcp: resumed the Microsoft session without a password.");
-      return;
-    }
-    let source;
-    try {
-      source = passwordSource();
-    } catch (error) {
-      throw new MailError("AUTH_REQUIRED", (error as Error).message);
-    }
-    if (source.kind === "file") {
-      const report = inspectPasswordFile(source.path);
-      if (!report.valid) throw new MailError("AUTH_REQUIRED", report.message ?? "Password file misconfigured.");
-    }
-    if (!username || source.kind === "none") {
-      throw new MailError("AUTH_REQUIRED", sessionExpired +
-        " To sign back in automatically, set OUTLOOK_USERNAME and OUTLOOK_PASSWORD (or OUTLOOK_PASSWORD_FILE) in .env.");
-    }
     if (Date.now() < this.signInBlockedUntil) {
       throw new MailError("AUTH_REQUIRED", (this.signInBlockedReason ?? "Automatic sign-in is cooling down after a recent attempt.") + " " + signInHelp);
     }
-    try {
-      await reauthenticate(page, username, source);
-      this.clearSignInCooldown();
-      console.error("outlook-mcp: signed back in automatically with the configured credentials.");
-    } catch (error) {
-      if (error instanceof PasswordFileError) {
+    let operation = "resume";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        this.checkpoint();
+        if (attempt) {
+          operation = "close_context";
+          await this.shutdownBrowser();
+          this.checkpoint();
+          operation = "launch_context";
+          // The normal launcher reopens the SAME persistent profile; never delete or copy it.
+          page = await this.ensurePage();
+          operation = "navigate";
+          await page.goto(mailbox.href, { waitUntil: "domcontentloaded", timeout: 30000 });
+        }
+        operation = "resume";
+        const resumed = await resumeSignIn(page, username);
+        this.checkpoint();
+        if (resumed !== "signed_in") {
+          operation = "credentials";
+          let source;
+          try {
+            source = passwordSource();
+          } catch (error) {
+            throw new MailError("AUTH_REQUIRED", (error as Error).message);
+          }
+          if (source.kind === "file") {
+            const report = inspectPasswordFile(source.path);
+            if (!report.valid) throw new MailError("AUTH_REQUIRED", report.message ?? "Password file misconfigured.");
+          }
+          if (!username || source.kind === "none") {
+            throw new MailError("AUTH_REQUIRED", sessionExpired +
+              " To sign back in automatically, set OUTLOOK_USERNAME and OUTLOOK_PASSWORD (or OUTLOOK_PASSWORD_FILE) in .env.");
+          }
+          await reauthenticate(page, username, source);
+        }
+        this.checkpoint();
         this.clearSignInCooldown();
-        throw new MailError("AUTH_REQUIRED", error.message);
+        console.error("outlook-mcp: signed back in automatically.");
+        // Unwind all callers holding the closed page and restart work with ensurePage().
+        if (attempt) throw new RecoveredWithFreshPage();
+        return;
+      } catch (error) {
+        if (error instanceof RecoveredWithFreshPage) throw error;
+        this.checkpoint();
+        if (error instanceof MailError) throw error;
+        const diagnostic = automaticSignInDiagnostic(error);
+        const message = "Automatic sign-in failed (" + operation + ": " + diagnostic.kind + ").";
+        console.error("outlook-mcp: " + message);
+        if (error instanceof PasswordFileError || error instanceof ProfileLockedError ||
+            (error instanceof SignInError && error.problem !== "stuck")) {
+          const rejected = error instanceof SignInError && ["password_rejected", "account_rejected", "account_locked"].includes(error.problem);
+          this.signInBlockedUntil = Date.now() + (rejected ? 6 * 3600_000 : 15 * 60_000);
+          this.signInBlockedReason = message + " Automatic sign-in is paused.";
+          throw new MailError("AUTH_REQUIRED", message + " " + signInHelp);
+        }
+        if (!attempt && diagnostic.transient && !this.freshSignInRetryTried) {
+          this.freshSignInRetryTried = true;
+          continue;
+        }
+        this.signInBlockedUntil = Date.now() + 2 * 60_000;
+        this.signInBlockedReason = "Automatic sign-in is cooling down after a recent attempt.";
+        throw new MailError("AUTH_REQUIRED", message + " " + signInHelp);
       }
-      // Browser errors can echo the password that was filled, so only our own messages are forwarded.
-      if (error instanceof SignInError && error.problem !== "stuck") {
-        // Retrying a rejected password risks locking the account; wait for npm run login or a long cooldown.
-        const rejected = error.problem === "password_rejected" || error.problem === "account_rejected" || error.problem === "account_locked";
-        this.signInBlockedUntil = Date.now() + (rejected ? 6 * 3600_000 : 15 * 60_000);
-        this.signInBlockedReason = error.message + " Automatic sign-in is paused.";
-        throw new MailError("AUTH_REQUIRED", error.message);
-      }
-      // Transient failures (slow pages, unexpected prompts) retry soon.
-      this.signInBlockedUntil = Date.now() + 2 * 60_000;
-      this.signInBlockedReason = "Automatic sign-in is cooling down after a recent attempt.";
-      throw new MailError("AUTH_REQUIRED", "Automatic sign-in failed. " + signInHelp);
     }
   }
 

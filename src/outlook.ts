@@ -434,7 +434,11 @@ export class Outlook {
               if (!this.canRetry(error)) throw error;
               operation.retryAllowed = false;
               if (this.classify(error).code === "BROWSER_RESTARTED") await this.shutdownBrowser();
-              await this.cleanView();
+              try {
+                await this.cleanView();
+              } catch (cleanupError) {
+                if (!(cleanupError instanceof RecoveredWithFreshPage)) throw cleanupError;
+              }
             }
           }
         };
@@ -1332,6 +1336,7 @@ export class Outlook {
           this.preventRetry();
         } catch (error) {
           this.checkpoint();
+          if (error instanceof RecoveredWithFreshPage) throw error;
           if (await this.sessionLost(page, error)) throw error;
           if (this.canRetry(error)) throw error;
           results.push({ message_id, error: errorInfo(this.classify(error)) });
